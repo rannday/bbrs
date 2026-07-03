@@ -212,14 +212,32 @@ func isInteractive(file *os.File) bool {
 type app struct {
 	options syncer.Options
 	output  io.Writer
+	sync    syncFunc
 
 	mu     sync.Mutex
-	syncMu sync.Mutex
-	client *bitburner.Client
+	client remoteClient
+
+	syncMu                     sync.Mutex
+	syncRunning                bool
+	syncPending                bool
+	everConnected              bool
+	waitingForConnectionLogged bool
+	disconnectedPendingLogged  bool
 }
 
+type remoteClient interface {
+	syncer.RemoteAPI
+	Connected() bool
+	Disconnected() <-chan struct{}
+	Close(websocket.StatusCode, string) error
+	SetDisconnectHandler(func(error))
+	MarkDisconnected(error) bool
+}
+
+type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error)
+
 func newApp(options syncer.Options, output io.Writer) *app {
-	return &app{options: options, output: output}
+	return &app{options: options, output: output, sync: syncer.Mirror}
 }
 
 func (app *app) handler() http.Handler {
@@ -239,27 +257,27 @@ func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Reques
 	}
 
 	client := bitburner.NewClient(conn)
+	client.SetDisconnectHandler(func(err error) {
+		app.handleClientDisconnected(client, err)
+	})
 	if !app.setClient(client) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "bbrs already has an active Bitburner connection")
 		return
 	}
-	defer app.clearClient(client)
 	defer client.Close(websocket.StatusNormalClosure, "bbrs connection closed")
 
+	app.markConnected()
 	fmt.Fprintln(app.output, "Bitburner connected")
 	app.triggerSync("Bitburner connection")
 
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		if err := client.Ping(request.Context()); err != nil {
-			fmt.Fprintln(app.output, "Bitburner connection lost:", err)
-			return
-		}
+	select {
+	case <-client.Disconnected():
+	case <-request.Context().Done():
+		client.MarkDisconnected(request.Context().Err())
 	}
 }
 
-func (app *app) setClient(client *bitburner.Client) bool {
+func (app *app) setClient(client remoteClient) bool {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	if app.client != nil {
@@ -269,7 +287,7 @@ func (app *app) setClient(client *bitburner.Client) bool {
 	return true
 }
 
-func (app *app) clearClient(client *bitburner.Client) {
+func (app *app) clearClient(client remoteClient) {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	if app.client == client {
@@ -277,24 +295,110 @@ func (app *app) clearClient(client *bitburner.Client) {
 	}
 }
 
-func (app *app) activeClient() *bitburner.Client {
+func (app *app) activeClient() remoteClient {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	return app.client
 }
 
+func (app *app) hasConnectedClient() bool {
+	client := app.activeClient()
+	return client != nil && client.Connected()
+}
+
+func (app *app) markConnected() {
+	app.syncMu.Lock()
+	app.everConnected = true
+	app.syncMu.Unlock()
+}
+
+func (app *app) handleClientDisconnected(client remoteClient, err error) {
+	app.clearClient(client)
+	if err == nil {
+		err = errors.New("connection closed")
+	}
+	fmt.Fprintln(app.output, "Bitburner connection lost:", err)
+}
+
 func (app *app) triggerSync(reason string) {
 	app.syncMu.Lock()
-	defer app.syncMu.Unlock()
+	if app.syncRunning {
+		app.syncPending = true
+		app.syncMu.Unlock()
+		return
+	}
+	app.syncRunning = true
+	app.syncMu.Unlock()
 
+	currentReason := reason
+	for {
+		app.syncMu.Lock()
+		hadPending := app.syncPending
+		app.syncPending = false
+		app.syncMu.Unlock()
+
+		success := app.runOneSync(currentReason)
+
+		if !app.finishSyncRun(success, hadPending) {
+			return
+		}
+		currentReason = "pending sync"
+	}
+}
+
+func (app *app) runOneSync(reason string) bool {
 	client := app.activeClient()
-	if client == nil {
-		return
+	if client == nil || !client.Connected() {
+		app.markSyncPendingDisconnected()
+		return false
 	}
-	summary, err := syncer.Mirror(context.Background(), client, app.options)
+	summary, err := app.sync(context.Background(), client, app.options)
 	if err != nil {
+		if !client.Connected() {
+			app.markSyncPendingDisconnected()
+			return false
+		}
 		fmt.Fprintf(app.output, "sync failed after %s: %v\n", reason, err)
+		return false
+	}
+	app.syncMu.Lock()
+	app.disconnectedPendingLogged = false
+	app.waitingForConnectionLogged = false
+	app.syncMu.Unlock()
+	fmt.Fprintf(app.output, "sync complete: uploaded=%d deleted=%d ignored=%d\n", summary.Uploaded, summary.Deleted, summary.Ignored)
+	return true
+}
+
+func (app *app) finishSyncRun(success, hadPending bool) bool {
+	connected := app.hasConnectedClient()
+
+	app.syncMu.Lock()
+	defer app.syncMu.Unlock()
+	if !success && hadPending {
+		app.syncPending = true
+	}
+	if success && app.syncPending && connected {
+		return true
+	}
+	app.syncRunning = false
+	return false
+}
+
+func (app *app) markSyncPendingDisconnected() {
+	app.syncMu.Lock()
+	defer app.syncMu.Unlock()
+	app.syncPending = true
+	if !app.everConnected {
+		if app.waitingForConnectionLogged {
+			return
+		}
+		app.waitingForConnectionLogged = true
+		fmt.Fprintln(app.output, "waiting for Bitburner to connect...")
 		return
 	}
-	fmt.Fprintf(app.output, "sync complete: uploaded=%d deleted=%d ignored=%d\n", summary.Uploaded, summary.Deleted, summary.Ignored)
+	if app.disconnectedPendingLogged {
+		return
+	}
+	app.disconnectedPendingLogged = true
+	fmt.Fprintln(app.output, "Bitburner disconnected; sync pending")
 }

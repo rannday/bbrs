@@ -13,15 +13,33 @@ import (
 const RequestTimeout = 30 * time.Second
 
 type Client struct {
-	conn   *websocket.Conn
+	conn   websocketConn
 	mu     sync.Mutex
 	nextID uint64
+
+	stateMu       sync.Mutex
+	connected     bool
+	disconnected  chan struct{}
+	disconnectErr error
+	onDisconnect  func(error)
 }
 
 func NewClient(conn *websocket.Conn) *Client {
+	return newClient(conn)
+}
+
+type websocketConn interface {
+	Write(context.Context, websocket.MessageType, []byte) error
+	Read(context.Context) (websocket.MessageType, []byte, error)
+	Close(websocket.StatusCode, string) error
+}
+
+func newClient(conn websocketConn) *Client {
 	return &Client{
-		conn:   conn,
-		nextID: 1,
+		conn:         conn,
+		nextID:       1,
+		connected:    true,
+		disconnected: make(chan struct{}),
 	}
 }
 
@@ -29,13 +47,44 @@ func (client *Client) Close(status websocket.StatusCode, reason string) error {
 	return client.conn.Close(status, reason)
 }
 
-func (client *Client) Ping(ctx context.Context) error {
-	client.mu.Lock()
-	defer client.mu.Unlock()
+func (client *Client) Connected() bool {
+	client.stateMu.Lock()
+	defer client.stateMu.Unlock()
+	return client.connected
+}
 
-	pingCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
-	defer cancel()
-	return client.conn.Ping(pingCtx)
+func (client *Client) Disconnected() <-chan struct{} {
+	return client.disconnected
+}
+
+func (client *Client) DisconnectErr() error {
+	client.stateMu.Lock()
+	defer client.stateMu.Unlock()
+	return client.disconnectErr
+}
+
+func (client *Client) SetDisconnectHandler(handler func(error)) {
+	client.stateMu.Lock()
+	client.onDisconnect = handler
+	client.stateMu.Unlock()
+}
+
+func (client *Client) MarkDisconnected(err error) bool {
+	client.stateMu.Lock()
+	if !client.connected {
+		client.stateMu.Unlock()
+		return false
+	}
+	client.connected = false
+	client.disconnectErr = err
+	close(client.disconnected)
+	handler := client.onDisconnect
+	client.stateMu.Unlock()
+
+	if handler != nil {
+		handler(err)
+	}
+	return true
 }
 
 func (client *Client) GetFileNames(ctx context.Context, server string) ([]string, error) {
@@ -87,6 +136,10 @@ func (client *Client) requestRaw(ctx context.Context, method string, params inte
 	client.mu.Lock()
 	defer client.mu.Unlock()
 
+	if !client.Connected() {
+		return nil, fmt.Errorf("send %s request: Bitburner disconnected", method)
+	}
+
 	requestID := client.nextID
 	client.nextID++
 	if client.nextID == 0 {
@@ -103,12 +156,16 @@ func (client *Client) requestRaw(ctx context.Context, method string, params inte
 	defer cancel()
 
 	if err := client.conn.Write(requestCtx, websocket.MessageText, data); err != nil {
-		return nil, fmt.Errorf("send %s request: %w", method, err)
+		writeErr := fmt.Errorf("write failed: %w", err)
+		client.MarkDisconnected(writeErr)
+		return nil, fmt.Errorf("send %s request: %w", method, writeErr)
 	}
 
 	messageType, responseData, err := client.conn.Read(requestCtx)
 	if err != nil {
-		return nil, fmt.Errorf("%s timed out or failed waiting for response: %w", method, err)
+		readErr := fmt.Errorf("read failed: %w", err)
+		client.MarkDisconnected(readErr)
+		return nil, fmt.Errorf("%s timed out or failed waiting for response: %w", method, readErr)
 	}
 	if messageType != websocket.MessageText && messageType != websocket.MessageBinary {
 		return nil, fmt.Errorf("%s returned unsupported websocket message type %v", method, messageType)
