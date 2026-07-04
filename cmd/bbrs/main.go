@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -19,7 +20,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	logx "github.com/rannday/go-log"
 	"github.com/rannday/bbrs/internal/bitburner"
+	"github.com/rannday/bbrs/internal/logging"
 	"github.com/rannday/bbrs/internal/syncer"
 	"github.com/rannday/bbrs/internal/watch"
 )
@@ -32,6 +35,7 @@ type config struct {
 	Host        string
 	Patterns    []string
 	Yes         bool
+	LogDir      string
 }
 
 type patternFlags []string
@@ -47,7 +51,7 @@ func (flags *patternFlags) Set(value string) error {
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		logx.ErrorErr("bbrs failed", err)
 		os.Exit(1)
 	}
 }
@@ -60,6 +64,15 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		}
 		return err
 	}
+
+	logPath, err := logging.ResolveLogPath(cfg.LogDir, cfg.Source)
+	if err != nil {
+		return err
+	}
+	if err := logging.Configure(logPath); err != nil {
+		return fmt.Errorf("configure logging: %w", err)
+	}
+	logx.Info("logging enabled", "path", logPath)
 
 	patterns, err := syncer.NewPatterns(cfg.Patterns)
 	if err != nil {
@@ -83,13 +96,13 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		Host:        cfg.Host,
 		Patterns:    patterns,
 		State:       syncer.NewState(),
-	}, stdout)
+	})
 
 	go func() {
 		if err := watch.Poll(ctx, cfg.Source, patterns, 750*time.Millisecond, 200*time.Millisecond, func() {
 			app.triggerSync("local file change")
 		}); err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stderr, "watch error:", err)
+			logx.ErrorErr("watch failed", err)
 		}
 	}()
 
@@ -106,7 +119,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(stdout, "listening for Bitburner Remote API websocket on ws://%s\n", address)
+		logx.Info("listening for Bitburner Remote API websocket", "address", "ws://"+address)
 		serverErr <- server.ListenAndServe()
 	}()
 
@@ -158,6 +171,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	fs.StringVar(&cfg.Destination, "destination", "", "destination directory inside Bitburner")
 	fs.StringVar(&cfg.Host, "host", cfg.Host, "destination Bitburner host")
 	fs.Var(&patterns, "pattern", "additional filename pattern to include")
+	fs.StringVar(&cfg.LogDir, "logdir", "", "directory for log files")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -204,18 +218,26 @@ Options:
   -d, --destination          Destination directory inside Bitburner. Default: empty/root.
       --host                 Destination Bitburner host. Default: home.
       --pattern              Additional filename patterns to include.
+      --logdir               Directory for log files.
   -y, --yes                  Skip destructive-operation confirmation.
 
 Pattern examples:
   --pattern '*.txt'
   --pattern '*.js,*.ts,*.ns'
   --pattern '*.script' --pattern '*.txt'
+
+Logging:
+  Default: /var/log/bbrs/ on Unix when present, otherwise <source>/.bbrs/
 `
 }
 
 func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string, skip bool) (bool, error) {
-	fmt.Fprintf(stdout, "WARNING: bbrs mirrors your local source directory into Bitburner.\n")
-	fmt.Fprintf(stdout, "Remote files on host %q under destination %q that match the active patterns may be overwritten or deleted.\n\n", host, syncer.DisplayDestination(destination))
+	logx.Warn("bbrs mirrors your local source directory into Bitburner")
+	logx.Warn(
+		"remote files may be overwritten or deleted",
+		"host", host,
+		"destination", syncer.DisplayDestination(destination),
+	)
 
 	if skip || !isInteractive(stdin) {
 		return true, nil
@@ -252,7 +274,6 @@ func isInteractive(file *os.File) bool {
 type app struct {
 	ctx     context.Context
 	options syncer.Options
-	output  io.Writer
 	sync    syncFunc
 
 	mu     sync.Mutex
@@ -277,8 +298,8 @@ type remoteClient interface {
 
 type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error)
 
-func newApp(ctx context.Context, options syncer.Options, output io.Writer) *app {
-	return &app{ctx: ctx, options: options, output: output, sync: syncer.Mirror}
+func newApp(ctx context.Context, options syncer.Options) *app {
+	return &app{ctx: ctx, options: options, sync: syncer.Mirror}
 }
 
 func (app *app) handler() http.Handler {
@@ -293,7 +314,7 @@ func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Reques
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		fmt.Fprintln(app.output, "websocket accept failed:", err)
+		logx.ErrorErr("websocket accept failed", err)
 		return
 	}
 
@@ -308,7 +329,7 @@ func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Reques
 	defer client.Close(websocket.StatusNormalClosure, "bbrs connection closed")
 
 	app.markConnected()
-	fmt.Fprintln(app.output, "Bitburner connected")
+	logx.Info("Bitburner connected")
 	app.triggerSync("Bitburner connection")
 
 	select {
@@ -360,7 +381,7 @@ func (app *app) handleClientDisconnected(client remoteClient, err error) {
 	if err == nil {
 		err = errors.New("connection closed")
 	}
-	fmt.Fprintln(app.output, "Bitburner connection lost:", err)
+	logx.Warn("Bitburner connection lost", slog.Any("error", err))
 }
 
 func (app *app) triggerSync(reason string) {
@@ -404,14 +425,20 @@ func (app *app) runOneSync(reason string) bool {
 			app.markSyncPendingDisconnected()
 			return false
 		}
-		fmt.Fprintf(app.output, "sync failed after %s: %v\n", reason, err)
+		logx.ErrorErr("sync failed", err, "reason", reason)
 		return false
 	}
 	app.syncMu.Lock()
 	app.disconnectedPendingLogged = false
 	app.waitingForConnectionLogged = false
 	app.syncMu.Unlock()
-	fmt.Fprintf(app.output, "sync complete: uploaded=%d skipped=%d deleted=%d ignored=%d\n", summary.Uploaded, summary.Skipped, summary.Deleted, summary.Ignored)
+	logx.Info(
+		"sync complete",
+		"uploaded", summary.Uploaded,
+		"skipped", summary.Skipped,
+		"deleted", summary.Deleted,
+		"ignored", summary.Ignored,
+	)
 	return true
 }
 
@@ -439,12 +466,12 @@ func (app *app) markSyncPendingDisconnected() {
 			return
 		}
 		app.waitingForConnectionLogged = true
-		fmt.Fprintln(app.output, "waiting for Bitburner to connect...")
+		logx.Info("waiting for Bitburner to connect")
 		return
 	}
 	if app.disconnectedPendingLogged {
 		return
 	}
 	app.disconnectedPendingLogged = true
-	fmt.Fprintln(app.output, "Bitburner disconnected; sync pending")
+	logx.Info("Bitburner disconnected; sync pending")
 }

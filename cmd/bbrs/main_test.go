@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/coder/websocket"
+	logx "github.com/rannday/go-log"
 	"github.com/rannday/bbrs/internal/syncer"
 )
 
@@ -86,6 +88,15 @@ func (client *fakeRemoteClient) DeleteFile(context.Context, string, string) erro
 	return errors.New("unexpected DeleteFile")
 }
 
+func setupTestLogger(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logx.SetLogger(slog.New(handler))
+	t.Cleanup(logx.Reset)
+	return buf
+}
+
 func testOptions(t *testing.T) syncer.Options {
 	t.Helper()
 	patterns, err := syncer.NewPatterns(nil)
@@ -116,6 +127,9 @@ func TestParseConfigDefaultValues(t *testing.T) {
 	if cfg.Destination != "" {
 		t.Fatalf("destination = %q", cfg.Destination)
 	}
+	if cfg.LogDir != "" {
+		t.Fatalf("logdir = %q", cfg.LogDir)
+	}
 }
 
 func TestParseConfigRequiresSource(t *testing.T) {
@@ -133,6 +147,18 @@ func TestParseConfigNormalizesDestination(t *testing.T) {
 	}
 	if cfg.Destination != "scripts/batch" {
 		t.Fatalf("destination = %q", cfg.Destination)
+	}
+}
+
+func TestParseConfigAcceptsLogDir(t *testing.T) {
+	source := t.TempDir()
+	logDir := filepath.Join(source, "logs")
+	cfg, err := parseConfig([]string{"-s", source, "--logdir", logDir}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LogDir != logDir {
+		t.Fatalf("logdir = %q, want %q", cfg.LogDir, logDir)
 	}
 }
 
@@ -156,7 +182,10 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"--pattern '*.txt'",
 		"--pattern '*.js,*.ts,*.ns'",
 		"--pattern '*.script' --pattern '*.txt'",
+		"Logging:",
+		"Default: /var/log/bbrs/",
 		"--yes",
+		"--logdir               Directory for log files.",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
@@ -177,6 +206,7 @@ func TestParseConfigRejectsNonDirectorySource(t *testing.T) {
 }
 
 func TestConfirmDestructiveSkipsPromptWithYes(t *testing.T) {
+	setupTestLogger(t)
 	var output bytes.Buffer
 	proceed, err := confirmDestructive(os.Stdin, &output, "home", "scripts", true)
 	if err != nil {
@@ -204,8 +234,8 @@ func TestNoActivePingLoop(t *testing.T) {
 }
 
 func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	output := setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -218,7 +248,7 @@ func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
 	if calls != 0 {
 		t.Fatalf("sync calls = %d, want 0", calls)
 	}
-	if got := strings.Count(output.String(), "waiting for Bitburner to connect..."); got != 1 {
+	if got := strings.Count(output.String(), "waiting for Bitburner to connect"); got != 1 {
 		t.Fatalf("waiting log count = %d, output:\n%s", got, output.String())
 	}
 	if strings.Contains(output.String(), "Bitburner disconnected; sync pending") {
@@ -227,8 +257,8 @@ func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
 }
 
 func TestDisconnectedAfterPriorConnectionMarksPendingWithoutRPC(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	output := setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -245,14 +275,14 @@ func TestDisconnectedAfterPriorConnectionMarksPendingWithoutRPC(t *testing.T) {
 	if got := strings.Count(output.String(), "Bitburner disconnected; sync pending"); got != 1 {
 		t.Fatalf("pending log count = %d, output:\n%s", got, output.String())
 	}
-	if strings.Contains(output.String(), "waiting for Bitburner to connect...") {
+	if strings.Contains(output.String(), "waiting for Bitburner to connect") {
 		t.Fatalf("unexpected waiting log after prior connection:\n%s", output.String())
 	}
 }
 
 func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	output := setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -270,8 +300,9 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
 	}
-	if !strings.Contains(output.String(), "sync complete: uploaded=2 skipped=0 deleted=0 ignored=0") {
-		t.Fatalf("missing sync complete log:\n%s", output.String())
+	text := output.String()
+	if !strings.Contains(text, "sync complete") || !strings.Contains(text, "uploaded=2") {
+		t.Fatalf("missing sync complete log:\n%s", text)
 	}
 	app.syncMu.Lock()
 	defer app.syncMu.Unlock()
@@ -287,8 +318,8 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 }
 
 func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	output := setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -307,8 +338,9 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
 	}
-	if !strings.Contains(output.String(), "sync complete: uploaded=3 skipped=0 deleted=0 ignored=0") {
-		t.Fatalf("missing sync complete log:\n%s", output.String())
+	text := output.String()
+	if !strings.Contains(text, "sync complete") || !strings.Contains(text, "uploaded=3") {
+		t.Fatalf("missing sync complete log:\n%s", text)
 	}
 	app.syncMu.Lock()
 	defer app.syncMu.Unlock()
@@ -321,8 +353,8 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 }
 
 func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	client := newFakeRemoteClient(true)
 	if !app.setClient(client) {
 		t.Fatal("setClient failed")
@@ -382,8 +414,8 @@ func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 }
 
 func TestConnectionLostLoggingOncePerDisconnect(t *testing.T) {
-	var output bytes.Buffer
-	app := newApp(context.Background(), testOptions(t), &output)
+	output := setupTestLogger(t)
+	app := newApp(context.Background(), testOptions(t))
 	client := newFakeRemoteClient(true)
 	client.SetDisconnectHandler(func(err error) {
 		app.handleClientDisconnected(client, err)
@@ -395,7 +427,7 @@ func TestConnectionLostLoggingOncePerDisconnect(t *testing.T) {
 	client.MarkDisconnected(errors.New("write failed: use of closed network connection"))
 	client.MarkDisconnected(errors.New("again"))
 
-	if got := strings.Count(output.String(), "Bitburner connection lost:"); got != 1 {
+	if got := strings.Count(output.String(), "Bitburner connection lost"); got != 1 {
 		t.Fatalf("connection lost log count = %d, output:\n%s", got, output.String())
 	}
 	if app.activeClient() != nil {
@@ -407,8 +439,8 @@ func TestRunOneSyncRespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	var output bytes.Buffer
-	app := newApp(ctx, testOptions(t), &output)
+	setupTestLogger(t)
+	app := newApp(ctx, testOptions(t))
 	client := newFakeRemoteClient(true)
 	if !app.setClient(client) {
 		t.Fatal("setClient failed")

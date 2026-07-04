@@ -39,10 +39,31 @@ On first connection, `bbrs` performs a full sync. It keeps running and polls the
 -d, --destination  Destination directory inside Bitburner. Default: empty/root.
 --host             Destination Bitburner host. Default: home.
 --pattern          Additional filename patterns to include.
+--logdir           Directory for log files.
 -y, --yes          Skip destructive-operation confirmation.
 ```
 
 On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, and `ignored` counts. Unchanged local files are skipped using a local upload cache, so repeated syncs only push files that changed since the last successful upload.
+
+## Logging
+
+`bbrs` uses [go-log](https://github.com/rannday/go-log) for structured console and file logging.
+
+Default log location:
+
+- Unix-like systems: `/var/log/bbrs/` when that directory already exists.
+- Otherwise: `<source>/.bbrs/`
+- Windows: `<source>/.bbrs/`
+
+Each run writes to `bbrs_log_<timestamp>.log`. Logs rotate at 10 MiB with up to five backups.
+
+Override with `--logdir`:
+
+```sh
+./bbrs -s ./src --logdir /tmp/bbrs-logs
+```
+
+`bbrs` always writes `bbrs_log_<timestamp>.log` inside the chosen directory and creates the directory when needed. The `.bbrs` directory is ignored during sync.
 
 ## Patterns
 
@@ -70,7 +91,7 @@ Patterns use Go `path.Match` shell-style glob rules and match slash-normalized r
 Each sync:
 
 1. Walks `--source`.
-2. Skips ignored directories: `.git`, `target`, `node_modules`, `dist`, `build`, `.zed`, `.vscode`, `.idea`, `coverage`, `tmp`, `temp`.
+2. Skips ignored directories: `.bbrs`, `.git`, `target`, `node_modules`, `dist`, `build`, `.zed`, `.vscode`, `.idea`, `coverage`, `tmp`, `temp`.
 3. Uploads every desired local file to `--host` under `--destination`.
 4. Fetches remote names with `getFileNames`.
 5. Deletes stale remote files only when they are under `--destination` and match active patterns.

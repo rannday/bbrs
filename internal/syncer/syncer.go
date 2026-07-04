@@ -8,6 +8,7 @@ import (
 )
 
 var IgnoredDirNames = []string{
+	".bbrs",
 	".git",
 	"target",
 	"node_modules",
