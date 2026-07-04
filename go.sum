@@ -1,4 +1,4 @@
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
-github.com/rannday/go-log v0.1.0 h1:RBJB+1nWf3fP4CP3btjfwGjBznd1bnOYbsdkzlQxaJo=
-github.com/rannday/go-log v0.1.0/go.mod h1:TSkIcg+teKm1R9cEMiG/xfFvE9Pj6d+EZF2pcEeiY4s=
+github.com/rannday/go-log v0.1.1 h1:NUwIG031+VrKOZtcyFVHqvK6c9UoWKb3x8ypLjmAtfc=
+github.com/rannday/go-log v0.1.1/go.mod h1:TSkIcg+teKm1R9cEMiG/xfFvE9Pj6d+EZF2pcEeiY4s=
