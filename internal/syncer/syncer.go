@@ -43,6 +43,7 @@ type Options struct {
 	Host        string
 	Patterns    Patterns
 	State       *State
+	DryRun      bool
 }
 
 type DesiredFile struct {
@@ -165,14 +166,20 @@ func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error
 		return Summary{}, err
 	}
 
+	remotePresent := remotePresentSet(remoteMetadata)
 	uploaded := 0
 	skipped := 0
 	for _, file := range plan.Desired {
 		if err := ctx.Err(); err != nil {
 			return Summary{}, err
 		}
-		if options.State != nil && !options.State.ShouldUpload(file.Remote, file.Stamp) {
+		_, present := remotePresent[file.Remote]
+		if present && options.State != nil && !options.State.ShouldUpload(file.Remote, file.Stamp) {
 			skipped++
+			continue
+		}
+		if options.DryRun {
+			uploaded++
 			continue
 		}
 		content, err := os.ReadFile(file.SourcePath)
@@ -193,6 +200,10 @@ func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error
 		if err := ctx.Err(); err != nil {
 			return Summary{}, err
 		}
+		if options.DryRun {
+			deleted++
+			continue
+		}
 		if err := api.DeleteFile(ctx, options.Host, remote); err != nil {
 			return Summary{}, fmt.Errorf("delete %s: %w", remote, err)
 		}
@@ -208,6 +219,18 @@ func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error
 		Deleted:  deleted,
 		Ignored:  plan.Ignored,
 	}, nil
+}
+
+func remotePresentSet(metadata []FileMetadata) map[string]struct{} {
+	present := make(map[string]struct{}, len(metadata))
+	for _, entry := range metadata {
+		remote, err := NormalizeRemoteFilePath(entry.Filename)
+		if err != nil {
+			continue
+		}
+		present[remote] = struct{}{}
+	}
+	return present
 }
 
 func IsIgnoredDir(name string) bool {

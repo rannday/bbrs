@@ -23,6 +23,7 @@ go install ./cmd/bbrs
 ./bbrs -s ./src -d scripts
 ./bbrs -s ./src --host home --pattern '*.txt'
 ./bbrs -s ./src -l 127.0.0.1 -p 12525
+./bbrs -s ./src --dry-run
 ```
 
 `bbrs` starts a websocket server. In Bitburner, open `Options -> Remote API`, set host `127.0.0.1` and port `12525`, then connect.
@@ -33,6 +34,7 @@ On first connection, `bbrs` performs a full sync. It keeps running and polls the
 
 ```text
 -h, --help
+--version          Print version and exit.
 -s, --source       Local source directory to sync. Required.
 -l, --listen       Listen address. Default: 127.0.0.1.
 -p, --port         Listen port. Default: 12525.
@@ -40,10 +42,17 @@ On first connection, `bbrs` performs a full sync. It keeps running and polls the
 --host             Destination Bitburner host. Default: home.
 --pattern          Additional filename patterns to include.
 --logdir           Directory for log files.
+--dry-run          Build the sync plan without uploading, deleting, or updating cache.
+--allow-remote-listen
+                  Allow listening on non-loopback addresses.
 -y, --yes          Skip destructive-operation confirmation.
 ```
 
-On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, and `ignored` counts. Unchanged local files are skipped using a local upload cache, so repeated syncs only push files that changed since the last successful upload.
+On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, and `ignored` counts. Unchanged local files are skipped using a local upload cache only when the remote metadata still contains the file, so a remotely deleted file is uploaded again on the next sync.
+
+`--dry-run` still requires a Bitburner Remote API connection because it reads remote metadata, but it does not call `pushFile`, does not call `deleteFile`, and does not update the local upload cache. Counts mean would-upload, would-skip, would-delete, and ignored.
+
+By default, `--listen` accepts only loopback addresses such as `127.0.0.1`, `::1`, and `localhost`. Use `--allow-remote-listen` to bind a non-loopback address such as `0.0.0.0`. This can let remote browser origins connect and trigger destructive sync operations.
 
 ## Logging
 

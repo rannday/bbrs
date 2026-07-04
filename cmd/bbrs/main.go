@@ -20,22 +20,27 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	logx "github.com/rannday/go-log"
 	"github.com/rannday/bbrs/internal/bitburner"
 	"github.com/rannday/bbrs/internal/logging"
 	"github.com/rannday/bbrs/internal/syncer"
 	"github.com/rannday/bbrs/internal/watch"
+	logx "github.com/rannday/go-log"
 )
 
+var version = "dev"
+
 type config struct {
-	Source      string
-	Listen      string
-	Port        int
-	Destination string
-	Host        string
-	Patterns    []string
-	Yes         bool
-	LogDir      string
+	Source            string
+	Listen            string
+	Port              int
+	Destination       string
+	Host              string
+	Patterns          []string
+	Yes               bool
+	DryRun            bool
+	AllowRemoteListen bool
+	Version           bool
+	LogDir            string
 }
 
 type patternFlags []string
@@ -64,6 +69,10 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		}
 		return err
 	}
+	if cfg.Version {
+		fmt.Fprintln(stdout, version)
+		return nil
+	}
 
 	logPath, err := logging.ResolveLogPath(cfg.LogDir, cfg.Source)
 	if err != nil {
@@ -73,18 +82,26 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		return fmt.Errorf("configure logging: %w", err)
 	}
 	logx.Info("logging enabled", "path", logPath)
+	if cfg.AllowRemoteListen && !isLoopbackListenAddress(cfg.Listen) {
+		logx.Warn(
+			"non-loopback listen address enabled; remote browser origins may connect and trigger destructive sync operations",
+			"listen", cfg.Listen,
+		)
+	}
 
 	patterns, err := syncer.NewPatterns(cfg.Patterns)
 	if err != nil {
 		return err
 	}
 
-	proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination, cfg.Yes)
-	if err != nil {
-		return err
-	}
-	if !proceed {
-		return nil
+	if !cfg.DryRun {
+		proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination, cfg.Yes)
+		if err != nil {
+			return err
+		}
+		if !proceed {
+			return nil
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -96,6 +113,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		Host:        cfg.Host,
 		Patterns:    patterns,
 		State:       syncer.NewState(),
+		DryRun:      cfg.DryRun,
 	})
 
 	go func() {
@@ -161,6 +179,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	fs.BoolVar(&help, "help", false, "show help")
 	fs.BoolVar(&cfg.Yes, "y", false, "skip destructive-operation confirmation")
 	fs.BoolVar(&cfg.Yes, "yes", false, "skip destructive-operation confirmation")
+	fs.BoolVar(&cfg.DryRun, "dry-run", false, "build sync plan without uploading, deleting, or updating the cache")
+	fs.BoolVar(&cfg.AllowRemoteListen, "allow-remote-listen", false, "allow listening on non-loopback addresses")
+	fs.BoolVar(&cfg.Version, "version", false, "print version and exit")
 	fs.StringVar(&cfg.Source, "s", "", "local source directory to sync")
 	fs.StringVar(&cfg.Source, "source", "", "local source directory to sync")
 	fs.StringVar(&cfg.Listen, "l", cfg.Listen, "listen address")
@@ -179,6 +200,12 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	if help {
 		fs.Usage()
 		return config{}, flag.ErrHelp
+	}
+	if cfg.Version {
+		return cfg, nil
+	}
+	if !isLoopbackListenAddress(cfg.Listen) && !cfg.AllowRemoteListen {
+		return config{}, fmt.Errorf("listen address %q is not loopback; use --allow-remote-listen to allow remote browser origins", cfg.Listen)
 	}
 	if cfg.Source == "" {
 		return config{}, fmt.Errorf("--source is required")
@@ -212,6 +239,7 @@ func helpText() string {
 
 Options:
   -h, --help                 Show help.
+      --version              Print version and exit.
   -s, --source               Local source directory to sync. Required.
   -l, --listen               Listen address. Default: 127.0.0.1.
   -p, --port                 Listen port. Default: 12525.
@@ -219,6 +247,8 @@ Options:
       --host                 Destination Bitburner host. Default: home.
       --pattern              Additional filename patterns to include.
       --logdir               Directory for log files.
+      --dry-run              Build the sync plan without uploading, deleting, or updating cache.
+      --allow-remote-listen  Allow listening on non-loopback addresses.
   -y, --yes                  Skip destructive-operation confirmation.
 
 Pattern examples:
@@ -231,6 +261,8 @@ Logging:
 `
 }
 
+var stdinIsInteractive = isInteractive
+
 func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string, skip bool) (bool, error) {
 	logx.Warn("bbrs mirrors your local source directory into Bitburner")
 	logx.Warn(
@@ -239,8 +271,11 @@ func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination stri
 		"destination", syncer.DisplayDestination(destination),
 	)
 
-	if skip || !isInteractive(stdin) {
+	if skip {
 		return true, nil
+	}
+	if !stdinIsInteractive(stdin) {
+		return false, fmt.Errorf("refusing destructive sync in non-interactive mode without --yes")
 	}
 
 	fmt.Fprint(stdout, "Proceed? [Y/n]: ")
@@ -269,6 +304,14 @@ func isInteractive(file *os.File) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func isLoopbackListenAddress(address string) bool {
+	if strings.EqualFold(address, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(address)
+	return ip != nil && ip.IsLoopback()
 }
 
 type app struct {
@@ -432,8 +475,13 @@ func (app *app) runOneSync(reason string) bool {
 	app.disconnectedPendingLogged = false
 	app.waitingForConnectionLogged = false
 	app.syncMu.Unlock()
+	message := "sync complete"
+	if app.options.DryRun {
+		message = "dry run complete"
+	}
 	logx.Info(
-		"sync complete",
+		message,
+		"dry_run", app.options.DryRun,
 		"uploaded", summary.Uploaded,
 		"skipped", summary.Skipped,
 		"deleted", summary.Deleted,

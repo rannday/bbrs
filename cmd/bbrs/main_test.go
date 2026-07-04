@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/coder/websocket"
-	logx "github.com/rannday/go-log"
 	"github.com/rannday/bbrs/internal/syncer"
+	logx "github.com/rannday/go-log"
 )
 
 type fakeRemoteClient struct {
@@ -130,12 +130,78 @@ func TestParseConfigDefaultValues(t *testing.T) {
 	if cfg.LogDir != "" {
 		t.Fatalf("logdir = %q", cfg.LogDir)
 	}
+	if cfg.DryRun {
+		t.Fatal("dry run enabled by default")
+	}
+	if cfg.AllowRemoteListen {
+		t.Fatal("allow remote listen enabled by default")
+	}
+}
+
+func TestRunVersionPrintsWithoutSource(t *testing.T) {
+	var output bytes.Buffer
+	if err := run([]string{"--version"}, os.Stdin, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "dev\n" {
+		t.Fatalf("version output = %q", output.String())
+	}
 }
 
 func TestParseConfigRequiresSource(t *testing.T) {
 	_, err := parseConfig(nil, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "--source is required") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseConfigListenSafety(t *testing.T) {
+	source := t.TempDir()
+	tests := []struct {
+		name      string
+		args      []string
+		wantError string
+	}{
+		{
+			name: "default loopback",
+			args: []string{"-s", source},
+		},
+		{
+			name: "localhost loopback",
+			args: []string{"-s", source, "--listen", "localhost"},
+		},
+		{
+			name:      "wildcard rejected",
+			args:      []string{"-s", source, "--listen", "0.0.0.0"},
+			wantError: "use --allow-remote-listen",
+		},
+		{
+			name: "wildcard allowed",
+			args: []string{"-s", source, "--listen", "0.0.0.0", "--allow-remote-listen"},
+		},
+		{
+			name:      "ambiguous hostname rejected",
+			args:      []string{"-s", source, "--listen", "devbox"},
+			wantError: "use --allow-remote-listen",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(tc.args, &bytes.Buffer{})
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("err = %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(strings.Join(tc.args, " "), "--allow-remote-listen") && !cfg.AllowRemoteListen {
+				t.Fatal("allow remote listen not set")
+			}
+		})
 	}
 }
 
@@ -186,6 +252,9 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"Default: /var/log/bbrs/",
 		"--yes",
 		"--logdir               Directory for log files.",
+		"--dry-run",
+		"--allow-remote-listen",
+		"--version",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
@@ -214,6 +283,25 @@ func TestConfirmDestructiveSkipsPromptWithYes(t *testing.T) {
 	}
 	if !proceed {
 		t.Fatal("expected proceed")
+	}
+	if strings.Contains(output.String(), "Proceed?") {
+		t.Fatalf("unexpected prompt:\n%s", output.String())
+	}
+}
+
+func TestConfirmDestructiveRejectsNonInteractiveWithoutYes(t *testing.T) {
+	setupTestLogger(t)
+	original := stdinIsInteractive
+	stdinIsInteractive = func(*os.File) bool { return false }
+	t.Cleanup(func() { stdinIsInteractive = original })
+
+	var output bytes.Buffer
+	proceed, err := confirmDestructive(os.Stdin, &output, "home", "scripts", false)
+	if err == nil || !strings.Contains(err.Error(), "refusing destructive sync in non-interactive mode without --yes") {
+		t.Fatalf("err = %v", err)
+	}
+	if proceed {
+		t.Fatal("expected refusal")
 	}
 	if strings.Contains(output.String(), "Proceed?") {
 		t.Fatalf("unexpected prompt:\n%s", output.String())

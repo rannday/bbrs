@@ -252,6 +252,44 @@ func TestMirrorSkipsUnchangedUploads(t *testing.T) {
 	}
 }
 
+func TestMirrorReuploadsCachedFileWhenRemoteMissing(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.js"), "v1")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "main.js"}}}
+	state := NewState()
+	options := Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		State:    state,
+	}
+
+	first, err := Mirror(context.Background(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Uploaded != 1 || first.Skipped != 0 {
+		t.Fatalf("first summary = %+v", first)
+	}
+
+	api.remoteMetadata = nil
+	second, err := Mirror(context.Background(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Uploaded != 1 || second.Skipped != 0 {
+		t.Fatalf("second summary = %+v", second)
+	}
+	if !reflect.DeepEqual(api.uploaded, []string{"main.js", "main.js"}) {
+		t.Fatalf("uploaded = %v", api.uploaded)
+	}
+}
+
 func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "main.js")
@@ -282,6 +320,58 @@ func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 	}
 	if len(api.uploaded) != 2 {
 		t.Fatalf("uploaded = %v", api.uploaded)
+	}
+}
+
+func TestMirrorDryRunDoesNotUploadDeleteOrMutateCache(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "main.js")
+	writeFile(t, mainPath, "v1")
+	writeFile(t, filepath.Join(root, "new.js"), "v1")
+	writeFile(t, filepath.Join(root, "notes.txt"), "ignored")
+
+	info, err := os.Stat(mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewState()
+	state.RememberUpload("main.js", FileStampFromInfo(info))
+	state.RememberUpload("old.js", FileStamp{Size: 3, ModTime: 4})
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{
+		{Filename: "main.js"},
+		{Filename: "old.js"},
+		{Filename: "/invalid.js"},
+	}}
+
+	summary, err := Mirror(context.Background(), api, Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		State:    state,
+		DryRun:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 1 || summary.Skipped != 1 || summary.Deleted != 1 || summary.Ignored != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if len(api.uploaded) != 0 {
+		t.Fatalf("uploaded = %v", api.uploaded)
+	}
+	if len(api.deleted) != 0 {
+		t.Fatalf("deleted = %v", api.deleted)
+	}
+	if _, ok := state.UploadCache["main.js"]; !ok {
+		t.Fatal("main.js cache entry missing")
+	}
+	if _, ok := state.UploadCache["old.js"]; !ok {
+		t.Fatal("old.js cache entry was mutated")
 	}
 }
 
