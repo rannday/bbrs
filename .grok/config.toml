@@ -1,0 +1,16 @@
+# Permissive permissions for scripting-heavy or automation repos.
+[permission]
+allow = [
+  "Read",
+  "Grep",
+  "Edit",
+  "Bash(*)",
+  "MCPTool(fff__*)",
+]
+deny = [
+  "Bash(rm -rf /)",
+  "Bash(rm -fr /)",
+  "Bash(rm -rf / *)",
+  "Bash(del /s /q C:\\*)",
+  "Bash(Remove-Item -Recurse -Force C:\\*)",
+]
