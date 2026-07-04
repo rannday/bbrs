@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -29,6 +31,7 @@ type config struct {
 	Destination string
 	Host        string
 	Patterns    []string
+	Yes         bool
 }
 
 type patternFlags []string
@@ -63,7 +66,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination)
+	proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination, cfg.Yes)
 	if err != nil {
 		return err
 	}
@@ -74,11 +77,12 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	app := newApp(syncer.Options{
+	app := newApp(ctx, syncer.Options{
 		Source:      cfg.Source,
 		Destination: cfg.Destination,
 		Host:        cfg.Host,
 		Patterns:    patterns,
+		State:       syncer.NewState(),
 	}, stdout)
 
 	go func() {
@@ -96,8 +100,34 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		Handler:           app.handler(),
 	}
 
-	fmt.Fprintf(stdout, "listening for Bitburner Remote API websocket on ws://%s\n", address)
-	return server.ListenAndServe()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		fmt.Fprintf(stdout, "listening for Bitburner Remote API websocket on ws://%s\n", address)
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-sigCh:
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return err
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -116,6 +146,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	var patterns patternFlags
 	fs.BoolVar(&help, "h", false, "show help")
 	fs.BoolVar(&help, "help", false, "show help")
+	fs.BoolVar(&cfg.Yes, "y", false, "skip destructive-operation confirmation")
+	fs.BoolVar(&cfg.Yes, "yes", false, "skip destructive-operation confirmation")
 	fs.StringVar(&cfg.Source, "s", "", "local source directory to sync")
 	fs.StringVar(&cfg.Source, "source", "", "local source directory to sync")
 	fs.StringVar(&cfg.Listen, "l", cfg.Listen, "listen address")
@@ -149,6 +181,13 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config{}, fmt.Errorf("resolve source %q: %w", cfg.Source, err)
 	}
 	cfg.Source = filepath.Clean(source)
+	if cfg.Destination != "" {
+		normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
+		if err != nil {
+			return config{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
+		}
+		cfg.Destination = normalized
+	}
 	cfg.Patterns = append([]string{}, patterns...)
 	return cfg, nil
 }
@@ -165,6 +204,7 @@ Options:
   -d, --destination          Destination directory inside Bitburner. Default: empty/root.
       --host                 Destination Bitburner host. Default: home.
       --pattern              Additional filename patterns to include.
+  -y, --yes                  Skip destructive-operation confirmation.
 
 Pattern examples:
   --pattern '*.txt'
@@ -173,11 +213,11 @@ Pattern examples:
 `
 }
 
-func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string) (bool, error) {
+func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string, skip bool) (bool, error) {
 	fmt.Fprintf(stdout, "WARNING: bbrs mirrors your local source directory into Bitburner.\n")
 	fmt.Fprintf(stdout, "Remote files on host %q under destination %q that match the active patterns may be overwritten or deleted.\n\n", host, syncer.DisplayDestination(destination))
 
-	if !isInteractive(stdin) {
+	if skip || !isInteractive(stdin) {
 		return true, nil
 	}
 
@@ -210,6 +250,7 @@ func isInteractive(file *os.File) bool {
 }
 
 type app struct {
+	ctx     context.Context
 	options syncer.Options
 	output  io.Writer
 	sync    syncFunc
@@ -236,8 +277,8 @@ type remoteClient interface {
 
 type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error)
 
-func newApp(options syncer.Options, output io.Writer) *app {
-	return &app{options: options, output: output, sync: syncer.Mirror}
+func newApp(ctx context.Context, options syncer.Options, output io.Writer) *app {
+	return &app{ctx: ctx, options: options, output: output, sync: syncer.Mirror}
 }
 
 func (app *app) handler() http.Handler {
@@ -274,6 +315,8 @@ func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Reques
 	case <-client.Disconnected():
 	case <-request.Context().Done():
 		client.MarkDisconnected(request.Context().Err())
+	case <-app.ctx.Done():
+		client.MarkDisconnected(app.ctx.Err())
 	}
 }
 
@@ -352,8 +395,11 @@ func (app *app) runOneSync(reason string) bool {
 		app.markSyncPendingDisconnected()
 		return false
 	}
-	summary, err := app.sync(context.Background(), client, app.options)
+	summary, err := app.sync(app.ctx, client, app.options)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return false
+		}
 		if !client.Connected() {
 			app.markSyncPendingDisconnected()
 			return false
@@ -365,7 +411,7 @@ func (app *app) runOneSync(reason string) bool {
 	app.disconnectedPendingLogged = false
 	app.waitingForConnectionLogged = false
 	app.syncMu.Unlock()
-	fmt.Fprintf(app.output, "sync complete: uploaded=%d deleted=%d ignored=%d\n", summary.Uploaded, summary.Deleted, summary.Ignored)
+	fmt.Fprintf(app.output, "sync complete: uploaded=%d skipped=%d deleted=%d ignored=%d\n", summary.Uploaded, summary.Skipped, summary.Deleted, summary.Ignored)
 	return true
 }
 

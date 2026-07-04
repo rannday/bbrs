@@ -2,9 +2,6 @@ package watch
 
 import (
 	"context"
-	"io/fs"
-	"path/filepath"
-	"reflect"
 	"time"
 
 	"github.com/rannday/bbrs/internal/syncer"
@@ -20,32 +17,11 @@ type Snapshot map[string]FileState
 
 func SnapshotSource(source string, patterns syncer.Patterns) (Snapshot, error) {
 	snapshot := make(Snapshot)
-	err := filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if current != source && syncer.IsIgnoredDir(entry.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		relativePath, err := filepath.Rel(source, current)
-		if err != nil {
-			return err
-		}
-		relative := syncer.NormalizeSlashes(relativePath)
-		snapshot[relative] = FileState{
-			Size:    info.Size(),
-			ModTime: info.ModTime().UnixNano(),
-			Matched: patterns.Match(relative),
+	err := syncer.WalkSource(source, patterns, func(entry syncer.SourceEntry) error {
+		snapshot[entry.Relative] = FileState{
+			Size:    entry.Info.Size(),
+			ModTime: entry.Info.ModTime().UnixNano(),
+			Matched: patterns.Match(entry.Relative),
 		}
 		return nil
 	})
@@ -54,11 +30,6 @@ func SnapshotSource(source string, patterns syncer.Patterns) (Snapshot, error) {
 
 func HasRelevantChange(previous, current Snapshot) bool {
 	if previous == nil {
-		for _, state := range current {
-			if state.Matched {
-				return true
-			}
-		}
 		return false
 	}
 
@@ -73,7 +44,7 @@ func HasRelevantChange(previous, current Snapshot) bool {
 	for key := range keys {
 		oldState, hadOld := previous[key]
 		newState, hasNew := current[key]
-		if hadOld && hasNew && reflect.DeepEqual(oldState, newState) {
+		if hadOld && hasNew && oldState == newState {
 			continue
 		}
 		if oldState.Matched || newState.Matched {
@@ -85,6 +56,7 @@ func HasRelevantChange(previous, current Snapshot) bool {
 
 func Poll(ctx context.Context, source string, patterns syncer.Patterns, interval, debounce time.Duration, onChange func()) error {
 	var previous Snapshot
+	var seeded bool
 	var debounceTimer *time.Timer
 	var debounceC <-chan time.Time
 
@@ -102,6 +74,11 @@ func Poll(ctx context.Context, source string, patterns syncer.Patterns, interval
 			current, err := SnapshotSource(source, patterns)
 			if err != nil {
 				return err
+			}
+			if !seeded {
+				previous = current
+				seeded = true
+				continue
 			}
 			if HasRelevantChange(previous, current) {
 				if debounceTimer == nil {

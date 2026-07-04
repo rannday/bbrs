@@ -3,9 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
 )
 
@@ -23,8 +21,17 @@ var IgnoredDirNames = []string{
 	"temp",
 }
 
+type FileMetadata struct {
+	Filename string `json:"filename"`
+	// Bitburner sends Unix epoch milliseconds. The remote_api.md prose docs
+	// describe these as strings, but the game API uses numbers.
+	Atime int64 `json:"atime"`
+	Btime int64 `json:"btime"`
+	Mtime int64 `json:"mtime"`
+}
+
 type RemoteAPI interface {
-	GetFileNames(ctx context.Context, server string) ([]string, error)
+	GetAllFileMetadata(ctx context.Context, server string) ([]FileMetadata, error)
 	PushFile(ctx context.Context, server, filename, content string) error
 	DeleteFile(ctx context.Context, server, filename string) error
 }
@@ -34,12 +41,14 @@ type Options struct {
 	Destination string
 	Host        string
 	Patterns    Patterns
+	State       *State
 }
 
 type DesiredFile struct {
 	SourcePath string
 	Relative   string
 	Remote     string
+	Stamp      FileStamp
 }
 
 type Plan struct {
@@ -50,8 +59,17 @@ type Plan struct {
 
 type Summary struct {
 	Uploaded int
+	Skipped  int
 	Deleted  int
 	Ignored  int
+}
+
+func RemoteNames(metadata []FileMetadata) []string {
+	names := make([]string, 0, len(metadata))
+	for _, entry := range metadata {
+		names = append(names, entry.Filename)
+	}
+	return names
 }
 
 func BuildPlan(source, destination string, patterns Patterns, remoteNames []string) (Plan, error) {
@@ -104,44 +122,20 @@ func BuildDesired(source, destination string, patterns Patterns) ([]DesiredFile,
 	files := make([]DesiredFile, 0)
 	ignored := 0
 
-	err := filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if current != source && IsIgnoredDir(entry.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-
-		relativePath, err := filepath.Rel(source, current)
-		if err != nil {
-			return err
-		}
-		relative, err := cleanRelativeSlashPath(relativePath)
-		if err != nil {
-			return err
-		}
-		if !patterns.Match(relative) {
+	err := WalkSource(source, patterns, func(entry SourceEntry) error {
+		if !patterns.Match(entry.Relative) {
 			ignored++
 			return nil
 		}
-		remote, err := JoinDestinationFile(destination, relative)
+		remote, err := JoinDestinationFile(destination, entry.Relative)
 		if err != nil {
 			return err
 		}
 		files = append(files, DesiredFile{
-			SourcePath: current,
-			Relative:   relative,
+			SourcePath: entry.SourcePath,
+			Relative:   entry.Relative,
 			Remote:     remote,
+			Stamp:      FileStampFromInfo(entry.Info),
 		})
 		return nil
 	})
@@ -156,22 +150,30 @@ func BuildDesired(source, destination string, patterns Patterns) ([]DesiredFile,
 }
 
 func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error) {
-	desired, ignored, err := BuildDesired(options.Source, options.Destination, options.Patterns)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return Summary{}, err
 	}
 
-	remoteNames, err := api.GetFileNames(ctx, options.Host)
+	remoteMetadata, err := api.GetAllFileMetadata(ctx, options.Host)
 	if err != nil {
-		return Summary{}, fmt.Errorf("get remote file names: %w", err)
+		return Summary{}, fmt.Errorf("get remote file metadata: %w", err)
 	}
-	deletes, err := BuildDeletes(options.Destination, options.Patterns, desired, remoteNames)
+
+	plan, err := BuildPlan(options.Source, options.Destination, options.Patterns, RemoteNames(remoteMetadata))
 	if err != nil {
 		return Summary{}, err
 	}
 
 	uploaded := 0
-	for _, file := range desired {
+	skipped := 0
+	for _, file := range plan.Desired {
+		if err := ctx.Err(); err != nil {
+			return Summary{}, err
+		}
+		if options.State != nil && !options.State.ShouldUpload(file.Remote, file.Stamp) {
+			skipped++
+			continue
+		}
 		content, err := os.ReadFile(file.SourcePath)
 		if err != nil {
 			return Summary{}, fmt.Errorf("read %s: %w", file.SourcePath, err)
@@ -179,21 +181,31 @@ func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error
 		if err := api.PushFile(ctx, options.Host, file.Remote, string(content)); err != nil {
 			return Summary{}, fmt.Errorf("upload %s: %w", file.Remote, err)
 		}
+		if options.State != nil {
+			options.State.RememberUpload(file.Remote, file.Stamp)
+		}
 		uploaded++
 	}
 
 	deleted := 0
-	for _, remote := range deletes {
+	for _, remote := range plan.Deletes {
+		if err := ctx.Err(); err != nil {
+			return Summary{}, err
+		}
 		if err := api.DeleteFile(ctx, options.Host, remote); err != nil {
 			return Summary{}, fmt.Errorf("delete %s: %w", remote, err)
+		}
+		if options.State != nil {
+			options.State.ForgetRemote(remote)
 		}
 		deleted++
 	}
 
 	return Summary{
 		Uploaded: uploaded,
+		Skipped:  skipped,
 		Deleted:  deleted,
-		Ignored:  ignored,
+		Ignored:  plan.Ignored,
 	}, nil
 }
 

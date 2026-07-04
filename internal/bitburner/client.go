@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/rannday/bbrs/internal/syncer"
 )
 
 const RequestTimeout = 30 * time.Second
@@ -93,6 +94,14 @@ func (client *Client) GetFileNames(ctx context.Context, server string) ([]string
 		return nil, err
 	}
 	return names, nil
+}
+
+func (client *Client) GetAllFileMetadata(ctx context.Context, server string) ([]syncer.FileMetadata, error) {
+	var metadata []syncer.FileMetadata
+	if err := client.requestResult(ctx, "getAllFileMetadata", map[string]string{"server": server}, &metadata); err != nil {
+		return nil, err
+	}
+	return metadata, nil
 }
 
 func (client *Client) PushFile(ctx context.Context, server, filename, content string) error {

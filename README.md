@@ -39,7 +39,10 @@ On first connection, `bbrs` performs a full sync. It keeps running and polls the
 -d, --destination  Destination directory inside Bitburner. Default: empty/root.
 --host             Destination Bitburner host. Default: home.
 --pattern          Additional filename patterns to include.
+-y, --yes          Skip destructive-operation confirmation.
 ```
+
+On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, and `ignored` counts. Unchanged local files are skipped using a local upload cache, so repeated syncs only push files that changed since the last successful upload.
 
 ## Patterns
 

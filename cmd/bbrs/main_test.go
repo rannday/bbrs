@@ -74,8 +74,8 @@ func (client *fakeRemoteClient) MarkDisconnected(err error) bool {
 	return true
 }
 
-func (client *fakeRemoteClient) GetFileNames(context.Context, string) ([]string, error) {
-	return nil, errors.New("unexpected GetFileNames")
+func (client *fakeRemoteClient) GetAllFileMetadata(context.Context, string) ([]syncer.FileMetadata, error) {
+	return nil, errors.New("unexpected GetAllFileMetadata")
 }
 
 func (client *fakeRemoteClient) PushFile(context.Context, string, string, string) error {
@@ -92,7 +92,7 @@ func testOptions(t *testing.T) syncer.Options {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return syncer.Options{Source: t.TempDir(), Host: "home", Patterns: patterns}
+	return syncer.Options{Source: t.TempDir(), Host: "home", Patterns: patterns, State: syncer.NewState()}
 }
 
 func TestParseConfigDefaultValues(t *testing.T) {
@@ -125,6 +125,25 @@ func TestParseConfigRequiresSource(t *testing.T) {
 	}
 }
 
+func TestParseConfigNormalizesDestination(t *testing.T) {
+	source := t.TempDir()
+	cfg, err := parseConfig([]string{"-s", source, "-d", "scripts/batch/"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Destination != "scripts/batch" {
+		t.Fatalf("destination = %q", cfg.Destination)
+	}
+}
+
+func TestParseConfigRejectsUnsafeDestination(t *testing.T) {
+	source := t.TempDir()
+	_, err := parseConfig([]string{"-s", source, "-d", "../escape"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "invalid destination") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestHelpIncludesPatternExamples(t *testing.T) {
 	var output bytes.Buffer
 	_, err := parseConfig([]string{"--help"}, &output)
@@ -137,6 +156,7 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"--pattern '*.txt'",
 		"--pattern '*.js,*.ts,*.ns'",
 		"--pattern '*.script' --pattern '*.txt'",
+		"--yes",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
@@ -156,6 +176,20 @@ func TestParseConfigRejectsNonDirectorySource(t *testing.T) {
 	}
 }
 
+func TestConfirmDestructiveSkipsPromptWithYes(t *testing.T) {
+	var output bytes.Buffer
+	proceed, err := confirmDestructive(os.Stdin, &output, "home", "scripts", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proceed {
+		t.Fatal("expected proceed")
+	}
+	if strings.Contains(output.String(), "Proceed?") {
+		t.Fatalf("unexpected prompt:\n%s", output.String())
+	}
+}
+
 func TestNoActivePingLoop(t *testing.T) {
 	for _, file := range []string{"main.go", filepath.Join("..", "..", "internal", "bitburner", "client.go")} {
 		data, err := os.ReadFile(file)
@@ -171,7 +205,7 @@ func TestNoActivePingLoop(t *testing.T) {
 
 func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -194,7 +228,7 @@ func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
 
 func TestDisconnectedAfterPriorConnectionMarksPendingWithoutRPC(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -218,7 +252,7 @@ func TestDisconnectedAfterPriorConnectionMarksPendingWithoutRPC(t *testing.T) {
 
 func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -236,7 +270,7 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
 	}
-	if !strings.Contains(output.String(), "sync complete: uploaded=2 deleted=0 ignored=0") {
+	if !strings.Contains(output.String(), "sync complete: uploaded=2 skipped=0 deleted=0 ignored=0") {
 		t.Fatalf("missing sync complete log:\n%s", output.String())
 	}
 	app.syncMu.Lock()
@@ -254,7 +288,7 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 
 func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	calls := 0
 	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
 		calls++
@@ -273,7 +307,7 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
 	}
-	if !strings.Contains(output.String(), "sync complete: uploaded=3 deleted=0 ignored=0") {
+	if !strings.Contains(output.String(), "sync complete: uploaded=3 skipped=0 deleted=0 ignored=0") {
 		t.Fatalf("missing sync complete log:\n%s", output.String())
 	}
 	app.syncMu.Lock()
@@ -288,7 +322,7 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 
 func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	client := newFakeRemoteClient(true)
 	if !app.setClient(client) {
 		t.Fatal("setClient failed")
@@ -349,7 +383,7 @@ func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 
 func TestConnectionLostLoggingOncePerDisconnect(t *testing.T) {
 	var output bytes.Buffer
-	app := newApp(testOptions(t), &output)
+	app := newApp(context.Background(), testOptions(t), &output)
 	client := newFakeRemoteClient(true)
 	client.SetDisconnectHandler(func(err error) {
 		app.handleClientDisconnected(client, err)
@@ -366,5 +400,24 @@ func TestConnectionLostLoggingOncePerDisconnect(t *testing.T) {
 	}
 	if app.activeClient() != nil {
 		t.Fatal("active client not cleared")
+	}
+}
+
+func TestRunOneSyncRespectsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var output bytes.Buffer
+	app := newApp(ctx, testOptions(t), &output)
+	client := newFakeRemoteClient(true)
+	if !app.setClient(client) {
+		t.Fatal("setClient failed")
+	}
+	app.sync = func(ctx context.Context, _ syncer.RemoteAPI, _ syncer.Options) (syncer.Summary, error) {
+		return syncer.Summary{}, ctx.Err()
+	}
+
+	if app.runOneSync("cancelled") {
+		t.Fatal("expected cancelled sync to fail")
 	}
 }

@@ -127,6 +127,36 @@ func TestIgnoredDirsSkippedCaseInsensitively(t *testing.T) {
 	}
 }
 
+func TestSymlinkedPathsAreSkipped(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "source")
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(outside, "main.js"), "outside")
+	writeFile(t, filepath.Join(root, "src", "main.js"), "ok")
+
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, _, err := BuildDesired(root, "", patterns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := remotePaths(desired)
+	want := []string{"src/main.js"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
 func TestSyncPlanOrderingIsDeterministic(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "z.js"), "z")
@@ -156,23 +186,24 @@ func TestMirrorDeletesOnlyMatchingStaleFilesUnderDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := &fakeAPI{remoteNames: []string{
-		"scripts/main.js",
-		"scripts/old.js",
-		"outside/old.js",
-		"scripts/data.json",
-		"scripts/types.d.ts",
+	api := &fakeAPI{remoteMetadata: []FileMetadata{
+		{Filename: "scripts/main.js"},
+		{Filename: "scripts/old.js"},
+		{Filename: "outside/old.js"},
+		{Filename: "scripts/data.json"},
+		{Filename: "scripts/types.d.ts"},
 	}}
 	summary, err := Mirror(context.Background(), api, Options{
 		Source:      root,
 		Destination: "scripts",
 		Host:        "home",
 		Patterns:    patterns,
+		State:       NewState(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Uploaded != 1 || summary.Deleted != 1 || summary.Ignored != 1 {
+	if summary.Uploaded != 1 || summary.Skipped != 0 || summary.Deleted != 1 || summary.Ignored != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
 	if !reflect.DeepEqual(api.deleted, []string{"scripts/old.js"}) {
@@ -183,14 +214,112 @@ func TestMirrorDeletesOnlyMatchingStaleFilesUnderDestination(t *testing.T) {
 	}
 }
 
-type fakeAPI struct {
-	remoteNames []string
-	uploaded    []string
-	deleted     []string
+func TestMirrorSkipsUnchangedUploads(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "main.js")
+	writeFile(t, path, "v1")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "main.js"}}}
+	state := NewState()
+	options := Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		State:    state,
+	}
+
+	first, err := Mirror(context.Background(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Uploaded != 1 || first.Skipped != 0 {
+		t.Fatalf("first summary = %+v", first)
+	}
+
+	second, err := Mirror(context.Background(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Uploaded != 0 || second.Skipped != 1 {
+		t.Fatalf("second summary = %+v", second)
+	}
+	if len(api.uploaded) != 1 {
+		t.Fatalf("uploaded = %v", api.uploaded)
+	}
 }
 
-func (api *fakeAPI) GetFileNames(_ context.Context, _ string) ([]string, error) {
-	return append([]string{}, api.remoteNames...), nil
+func TestMirrorUploadsAfterLocalModification(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "main.js")
+	writeFile(t, path, "v1")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "main.js"}}}
+	options := Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		State:    NewState(),
+	}
+	if _, err := Mirror(context.Background(), api, options); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, path, "v2")
+	summary, err := Mirror(context.Background(), api, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 1 || summary.Skipped != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if len(api.uploaded) != 2 {
+		t.Fatalf("uploaded = %v", api.uploaded)
+	}
+}
+
+func TestMirrorClearsUploadCacheOnDelete(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.js"), "ok")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "main.js"}, {Filename: "stale.js"}}}
+	state := NewState()
+	options := Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		State:    state,
+	}
+	if _, err := Mirror(context.Background(), api, options); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.UploadCache["main.js"]; !ok {
+		t.Fatal("expected uploaded file in cache")
+	}
+	if _, ok := state.UploadCache["stale.js"]; ok {
+		t.Fatal("stale remote path should not be cached")
+	}
+}
+
+type fakeAPI struct {
+	remoteMetadata []FileMetadata
+	uploaded       []string
+	deleted        []string
+}
+
+func (api *fakeAPI) GetAllFileMetadata(_ context.Context, _ string) ([]FileMetadata, error) {
+	return append([]FileMetadata{}, api.remoteMetadata...), nil
 }
 
 func (api *fakeAPI) PushFile(_ context.Context, _, filename, _ string) error {
