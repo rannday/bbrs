@@ -1,2 +1,8 @@
 /bbrs
+*.exe
+*.test
+*.out
 .bbrs/
+dist/
+coverage.out
+coverage.html

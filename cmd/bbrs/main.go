@@ -21,23 +21,26 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/rannday/bbrs/internal/bitburner"
+	"github.com/rannday/bbrs/internal/config"
 	"github.com/rannday/bbrs/internal/logging"
 	"github.com/rannday/bbrs/internal/syncer"
+	"github.com/rannday/bbrs/internal/version"
 	"github.com/rannday/bbrs/internal/watch"
 	logx "github.com/rannday/go-log"
 )
 
-var version = "dev"
-
-type config struct {
+type cliConfig struct {
 	Source            string
 	Listen            string
 	Port              int
 	Destination       string
 	Host              string
 	Patterns          []string
+	IgnoredDirs       []string
 	Yes               bool
 	DryRun            bool
+	Once              bool
+	Verbose           bool
 	AllowRemoteListen bool
 	Version           bool
 	LogDir            string
@@ -50,6 +53,17 @@ func (flags *patternFlags) String() string {
 }
 
 func (flags *patternFlags) Set(value string) error {
+	*flags = append(*flags, value)
+	return nil
+}
+
+type ignoredDirFlags []string
+
+func (flags *ignoredDirFlags) String() string {
+	return strings.Join(*flags, ",")
+}
+
+func (flags *ignoredDirFlags) Set(value string) error {
 	*flags = append(*flags, value)
 	return nil
 }
@@ -70,7 +84,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		return err
 	}
 	if cfg.Version {
-		fmt.Fprintln(stdout, version)
+		fmt.Fprintln(stdout, version.Version)
 		return nil
 	}
 
@@ -78,10 +92,14 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := logging.Configure(logPath); err != nil {
+	level := slog.LevelInfo
+	if cfg.Verbose {
+		level = slog.LevelDebug
+	}
+	if err := logging.Configure(logPath, level); err != nil {
 		return fmt.Errorf("configure logging: %w", err)
 	}
-	logx.Info("logging enabled", "path", logPath)
+	logx.Info("logging enabled", "path", logPath, "verbose", cfg.Verbose)
 	if cfg.AllowRemoteListen && !isLoopbackListenAddress(cfg.Listen) {
 		logx.Warn(
 			"non-loopback listen address enabled; remote browser origins may connect and trigger destructive sync operations",
@@ -93,6 +111,14 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	ignored := syncer.NewIgnoredDirs(cfg.IgnoredDirs)
+
+	cachePath := syncer.CachePath(cfg.Source)
+	state, err := syncer.LoadState(cachePath)
+	if err != nil {
+		return err
+	}
+	logx.Info("loaded upload cache", "path", cachePath, "entries", len(state.UploadCache))
 
 	if !cfg.DryRun {
 		proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination, cfg.Yes)
@@ -107,18 +133,22 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	app := newApp(ctx, syncer.Options{
+	options := syncer.Options{
 		Source:      cfg.Source,
 		Destination: cfg.Destination,
 		Host:        cfg.Host,
 		Patterns:    patterns,
-		State:       syncer.NewState(),
+		Ignored:     ignored,
+		State:       state,
+		CachePath:   cachePath,
 		DryRun:      cfg.DryRun,
-	})
+	}
+
+	app := newApp(ctx, options)
 
 	go func() {
-		if err := watch.Poll(ctx, cfg.Source, patterns, 750*time.Millisecond, 200*time.Millisecond, func() {
-			app.triggerSync("local file change")
+		if err := watch.Poll(ctx, cfg.Source, patterns, ignored, 750*time.Millisecond, 200*time.Millisecond, func(changes syncer.ChangeSet) {
+			app.queueSync("local file change", changes)
 		}); err != nil && !errors.Is(err, context.Canceled) {
 			logx.ErrorErr("watch failed", err)
 		}
@@ -141,6 +171,16 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		serverErr <- server.ListenAndServe()
 	}()
 
+	if cfg.Once {
+		if err := app.waitForSuccessfulSync(ctx, 2*time.Minute); err != nil {
+			return err
+		}
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		return server.Shutdown(shutdownCtx)
+	}
+
 	select {
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -161,8 +201,8 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func parseConfig(args []string, output io.Writer) (config, error) {
-	var cfg config
+func parseConfig(args []string, output io.Writer) (cliConfig, error) {
+	var cfg cliConfig
 	cfg.Listen = "127.0.0.1"
 	cfg.Port = 12525
 	cfg.Host = "home"
@@ -175,11 +215,14 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 	var help bool
 	var patterns patternFlags
+	var ignoredDirs ignoredDirFlags
 	fs.BoolVar(&help, "h", false, "show help")
 	fs.BoolVar(&help, "help", false, "show help")
 	fs.BoolVar(&cfg.Yes, "y", false, "skip destructive-operation confirmation")
 	fs.BoolVar(&cfg.Yes, "yes", false, "skip destructive-operation confirmation")
 	fs.BoolVar(&cfg.DryRun, "dry-run", false, "build sync plan without uploading, deleting, or updating the cache")
+	fs.BoolVar(&cfg.Once, "once", false, "sync once after Bitburner connects, then exit")
+	fs.BoolVar(&cfg.Verbose, "verbose", false, "enable debug logging")
 	fs.BoolVar(&cfg.AllowRemoteListen, "allow-remote-listen", false, "allow listening on non-loopback addresses")
 	fs.BoolVar(&cfg.Version, "version", false, "print version and exit")
 	fs.StringVar(&cfg.Source, "s", "", "local source directory to sync")
@@ -192,45 +235,93 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	fs.StringVar(&cfg.Destination, "destination", "", "destination directory inside Bitburner")
 	fs.StringVar(&cfg.Host, "host", cfg.Host, "destination Bitburner host")
 	fs.Var(&patterns, "pattern", "additional filename pattern to include")
-	fs.StringVar(&cfg.LogDir, "logdir", "", "directory for log files")
+	fs.Var(&ignoredDirs, "ignore-dir", "additional directory name to ignore during sync")
+	fs.StringVar(&cfg.LogDir, "log-dir", "", "directory for log files")
 
 	if err := fs.Parse(args); err != nil {
-		return config{}, err
+		return cliConfig{}, err
 	}
 	if help {
 		fs.Usage()
-		return config{}, flag.ErrHelp
+		return cliConfig{}, flag.ErrHelp
 	}
 	if cfg.Version {
 		return cfg, nil
 	}
-	if !isLoopbackListenAddress(cfg.Listen) && !cfg.AllowRemoteListen {
-		return config{}, fmt.Errorf("listen address %q is not loopback; use --allow-remote-listen to allow remote browser origins", cfg.Listen)
-	}
 	if cfg.Source == "" {
-		return config{}, fmt.Errorf("--source is required")
+		return cliConfig{}, fmt.Errorf("--source is required")
 	}
 	info, err := os.Stat(cfg.Source)
 	if err != nil {
-		return config{}, fmt.Errorf("source %q: %w", cfg.Source, err)
+		return cliConfig{}, fmt.Errorf("source %q: %w", cfg.Source, err)
 	}
 	if !info.IsDir() {
-		return config{}, fmt.Errorf("source %q is not a directory", cfg.Source)
+		return cliConfig{}, fmt.Errorf("source %q is not a directory", cfg.Source)
 	}
 	source, err := filepath.Abs(cfg.Source)
 	if err != nil {
-		return config{}, fmt.Errorf("resolve source %q: %w", cfg.Source, err)
+		return cliConfig{}, fmt.Errorf("resolve source %q: %w", cfg.Source, err)
 	}
 	cfg.Source = filepath.Clean(source)
+
+	fileCfg, err := config.Load(cfg.Source)
+	if err != nil {
+		return cliConfig{}, fmt.Errorf("load config: %w", err)
+	}
+	applyFileConfig(&cfg, fileCfg)
+
+	if !isLoopbackListenAddress(cfg.Listen) && !cfg.AllowRemoteListen {
+		return cliConfig{}, fmt.Errorf("listen address %q is not loopback; use --allow-remote-listen to allow remote browser origins", cfg.Listen)
+	}
 	if cfg.Destination != "" {
 		normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
 		if err != nil {
-			return config{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
+			return cliConfig{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
 		}
 		cfg.Destination = normalized
 	}
 	cfg.Patterns = append([]string{}, patterns...)
+	cfg.IgnoredDirs = append([]string{}, ignoredDirs...)
 	return cfg, nil
+}
+
+func applyFileConfig(cfg *cliConfig, file config.File) {
+	if file.Listen != "" {
+		cfg.Listen = file.Listen
+	}
+	if file.Port != nil {
+		cfg.Port = *file.Port
+	}
+	if file.Destination != "" {
+		cfg.Destination = file.Destination
+	}
+	if file.Host != "" {
+		cfg.Host = file.Host
+	}
+	if len(file.Patterns) > 0 && len(cfg.Patterns) == 0 {
+		cfg.Patterns = append([]string{}, file.Patterns...)
+	}
+	if file.LogDir != "" && cfg.LogDir == "" {
+		cfg.LogDir = file.LogDir
+	}
+	if file.AllowRemoteListen != nil && !cfg.AllowRemoteListen {
+		cfg.AllowRemoteListen = *file.AllowRemoteListen
+	}
+	if file.DryRun != nil && !cfg.DryRun {
+		cfg.DryRun = *file.DryRun
+	}
+	if file.Verbose != nil && !cfg.Verbose {
+		cfg.Verbose = *file.Verbose
+	}
+	if file.Once != nil && !cfg.Once {
+		cfg.Once = *file.Once
+	}
+	if file.Yes != nil && !cfg.Yes {
+		cfg.Yes = *file.Yes
+	}
+	if len(file.IgnoredDirs) > 0 && len(cfg.IgnoredDirs) == 0 {
+		cfg.IgnoredDirs = append([]string{}, file.IgnoredDirs...)
+	}
 }
 
 func helpText() string {
@@ -246,10 +337,20 @@ Options:
   -d, --destination          Destination directory inside Bitburner. Default: empty/root.
       --host                 Destination Bitburner host. Default: home.
       --pattern              Additional filename patterns to include.
-      --logdir               Directory for log files.
+      --ignore-dir           Additional directory name to ignore during sync.
+      --log-dir              Directory for log files.
       --dry-run              Build the sync plan without uploading, deleting, or updating cache.
+      --once                 Sync once after Bitburner connects, then exit.
+      --verbose              Enable debug logging.
       --allow-remote-listen  Allow listening on non-loopback addresses.
   -y, --yes                  Skip destructive-operation confirmation.
+
+Config file:
+  Optional settings in <source>/.bbrs/config.toml or <source>/.bbrs/config.json.
+  CLI flags override config file values.
+
+Persistent cache:
+  Upload cache stored in <source>/.bbrs/cache.json across restarts.
 
 Pattern examples:
   --pattern '*.txt'
@@ -266,7 +367,7 @@ var stdinIsInteractive = isInteractive
 func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string, skip bool) (bool, error) {
 	logx.Warn("bbrs mirrors your local source directory into Bitburner")
 	logx.Warn(
-		"remote files may be overwritten or deleted",
+		"remote files may be overwritten or deleted; stale matching files under the destination are removed",
 		"host", host,
 		"destination", syncer.DisplayDestination(destination),
 	)
@@ -314,17 +415,27 @@ func isLoopbackListenAddress(address string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+type syncJob struct {
+	reason  string
+	changes syncer.ChangeSet
+}
+
 type app struct {
 	ctx     context.Context
 	options syncer.Options
-	sync    syncFunc
+	syncFn  syncFunc
 
 	mu     sync.Mutex
 	client remoteClient
 
-	syncMu                     sync.Mutex
-	syncRunning                bool
-	syncPending                bool
+	workerMu sync.Mutex
+	running  bool
+	pending  *syncJob
+
+	statusMu   sync.Mutex
+	everSyncOK bool
+	syncOKCh   chan struct{}
+
 	everConnected              bool
 	waitingForConnectionLogged bool
 	disconnectedPendingLogged  bool
@@ -339,10 +450,22 @@ type remoteClient interface {
 	MarkDisconnected(error) bool
 }
 
-type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error)
+type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error)
 
 func newApp(ctx context.Context, options syncer.Options) *app {
-	return &app{ctx: ctx, options: options, sync: syncer.Mirror}
+	return &app{
+		ctx:      ctx,
+		options:  options,
+		syncFn:   defaultSyncFn,
+		syncOKCh: make(chan struct{}, 1),
+	}
+}
+
+func defaultSyncFn(ctx context.Context, api syncer.RemoteAPI, options syncer.Options, changes syncer.ChangeSet) (syncer.Result, error) {
+	if len(changes.Modified) == 0 && len(changes.Deleted) == 0 {
+		return syncer.Mirror(ctx, api, options)
+	}
+	return syncer.SyncChanges(ctx, api, options, changes)
 }
 
 func (app *app) handler() http.Handler {
@@ -353,7 +476,6 @@ func (app *app) handler() http.Handler {
 
 func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Request) {
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
-		// Bitburner runs in a browser origin that differs from localhost.
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -373,7 +495,7 @@ func (app *app) handleWebSocket(writer http.ResponseWriter, request *http.Reques
 
 	app.markConnected()
 	logx.Info("Bitburner connected")
-	app.triggerSync("Bitburner connection")
+	app.queueSync("Bitburner connection", syncer.ChangeSet{})
 
 	select {
 	case <-client.Disconnected():
@@ -414,9 +536,9 @@ func (app *app) hasConnectedClient() bool {
 }
 
 func (app *app) markConnected() {
-	app.syncMu.Lock()
+	app.workerMu.Lock()
 	app.everConnected = true
-	app.syncMu.Unlock()
+	app.workerMu.Unlock()
 }
 
 func (app *app) handleClientDisconnected(client remoteClient, err error) {
@@ -427,39 +549,82 @@ func (app *app) handleClientDisconnected(client remoteClient, err error) {
 	logx.Warn("Bitburner connection lost", slog.Any("error", err))
 }
 
-func (app *app) triggerSync(reason string) {
-	app.syncMu.Lock()
-	if app.syncRunning {
-		app.syncPending = true
-		app.syncMu.Unlock()
-		return
+func mergeJobs(current, incoming *syncJob) *syncJob {
+	if current == nil {
+		return incoming
 	}
-	app.syncRunning = true
-	app.syncMu.Unlock()
-
-	currentReason := reason
-	for {
-		app.syncMu.Lock()
-		hadPending := app.syncPending
-		app.syncPending = false
-		app.syncMu.Unlock()
-
-		success := app.runOneSync(currentReason)
-
-		if !app.finishSyncRun(success, hadPending) {
-			return
-		}
-		currentReason = "pending sync"
+	if incoming == nil {
+		return current
+	}
+	return &syncJob{
+		reason: incoming.reason,
+		changes: syncer.ChangeSet{
+			Modified: append(append([]string{}, current.changes.Modified...), incoming.changes.Modified...),
+			Deleted:  append(append([]string{}, current.changes.Deleted...), incoming.changes.Deleted...),
+		},
 	}
 }
 
-func (app *app) runOneSync(reason string) bool {
+func (app *app) queueSync(reason string, changes syncer.ChangeSet) {
+	job := &syncJob{reason: reason, changes: changes}
+
+	app.workerMu.Lock()
+	app.pending = mergeJobs(app.pending, job)
+	if app.running {
+		app.workerMu.Unlock()
+		return
+	}
+	if !app.hasConnectedClient() {
+		app.workerMu.Unlock()
+		app.markSyncPendingDisconnected()
+		return
+	}
+	app.running = true
+	job = app.pending
+	app.pending = nil
+	app.workerMu.Unlock()
+
+	go app.syncLoop(job)
+}
+
+func (app *app) syncLoop(job *syncJob) {
+	for {
+		if !app.hasConnectedClient() {
+			app.workerMu.Lock()
+			app.running = false
+			app.workerMu.Unlock()
+			app.markSyncPendingDisconnected()
+			return
+		}
+
+		app.runOneSync(job.reason, job.changes)
+
+		app.workerMu.Lock()
+		if !app.hasConnectedClient() {
+			app.running = false
+			app.workerMu.Unlock()
+			app.markSyncPendingDisconnected()
+			return
+		}
+		job = app.pending
+		app.pending = nil
+		if job == nil {
+			app.running = false
+			app.workerMu.Unlock()
+			return
+		}
+		app.workerMu.Unlock()
+	}
+}
+
+func (app *app) runOneSync(reason string, changes syncer.ChangeSet) bool {
 	client := app.activeClient()
 	if client == nil || !client.Connected() {
 		app.markSyncPendingDisconnected()
 		return false
 	}
-	summary, err := app.sync(app.ctx, client, app.options)
+
+	result, err := app.syncFn(app.ctx, client, app.options, changes)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return false
@@ -471,44 +636,52 @@ func (app *app) runOneSync(reason string) bool {
 		logx.ErrorErr("sync failed", err, "reason", reason)
 		return false
 	}
-	app.syncMu.Lock()
+
+	for _, syncErr := range result.Errors {
+		logx.Warn("sync issue", slog.Any("error", syncErr), "reason", reason)
+	}
+
+	app.workerMu.Lock()
 	app.disconnectedPendingLogged = false
 	app.waitingForConnectionLogged = false
-	app.syncMu.Unlock()
+	app.workerMu.Unlock()
+
 	message := "sync complete"
 	if app.options.DryRun {
 		message = "dry run complete"
 	}
 	logx.Info(
 		message,
+		"reason", reason,
 		"dry_run", app.options.DryRun,
-		"uploaded", summary.Uploaded,
-		"skipped", summary.Skipped,
-		"deleted", summary.Deleted,
-		"ignored", summary.Ignored,
+		"uploaded", result.Summary.Uploaded,
+		"skipped", result.Summary.Skipped,
+		"deleted", result.Summary.Deleted,
+		"ignored", result.Summary.Ignored,
+		"failed", result.Summary.Failed,
 	)
-	return true
-}
 
-func (app *app) finishSyncRun(success, hadPending bool) bool {
-	connected := app.hasConnectedClient()
-
-	app.syncMu.Lock()
-	defer app.syncMu.Unlock()
-	if !success && hadPending {
-		app.syncPending = true
+	if result.Summary.Failed == 0 {
+		app.statusMu.Lock()
+		if !app.everSyncOK {
+			app.everSyncOK = true
+			select {
+			case app.syncOKCh <- struct{}{}:
+			default:
+			}
+		}
+		app.statusMu.Unlock()
 	}
-	if success && app.syncPending && connected {
-		return true
-	}
-	app.syncRunning = false
-	return false
+	return result.Summary.Failed == 0
 }
 
 func (app *app) markSyncPendingDisconnected() {
-	app.syncMu.Lock()
-	defer app.syncMu.Unlock()
-	app.syncPending = true
+	app.workerMu.Lock()
+	defer app.workerMu.Unlock()
+
+	if !app.running {
+		// queueSync owns pending state when idle; reconnect will re-trigger.
+	}
 	if !app.everConnected {
 		if app.waitingForConnectionLogged {
 			return
@@ -522,4 +695,23 @@ func (app *app) markSyncPendingDisconnected() {
 	}
 	app.disconnectedPendingLogged = true
 	logx.Info("Bitburner disconnected; sync pending")
+}
+
+func (app *app) waitForSuccessfulSync(ctx context.Context, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-app.syncOKCh:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("timed out after %s waiting for successful sync", timeout)
+	}
+}
+
+// triggerSync queues a full mirror sync. Used by tests.
+func (app *app) triggerSync(reason string) {
+	app.queueSync(reason, syncer.ChangeSet{})
 }

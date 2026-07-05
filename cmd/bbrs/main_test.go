@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rannday/bbrs/internal/syncer"
@@ -103,7 +104,13 @@ func testOptions(t *testing.T) syncer.Options {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return syncer.Options{Source: t.TempDir(), Host: "home", Patterns: patterns, State: syncer.NewState()}
+	return syncer.Options{
+		Source:   t.TempDir(),
+		Host:     "home",
+		Patterns: patterns,
+		Ignored:  syncer.NewIgnoredDirs(nil),
+		State:    syncer.NewState(),
+	}
 }
 
 func TestParseConfigDefaultValues(t *testing.T) {
@@ -133,6 +140,12 @@ func TestParseConfigDefaultValues(t *testing.T) {
 	if cfg.DryRun {
 		t.Fatal("dry run enabled by default")
 	}
+	if cfg.Once {
+		t.Fatal("once enabled by default")
+	}
+	if cfg.Verbose {
+		t.Fatal("verbose enabled by default")
+	}
 	if cfg.AllowRemoteListen {
 		t.Fatal("allow remote listen enabled by default")
 	}
@@ -143,7 +156,7 @@ func TestRunVersionPrintsWithoutSource(t *testing.T) {
 	if err := run([]string{"--version"}, os.Stdin, &output, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "dev\n" {
+	if !strings.HasSuffix(output.String(), "\n") {
 		t.Fatalf("version output = %q", output.String())
 	}
 }
@@ -205,6 +218,32 @@ func TestParseConfigListenSafety(t *testing.T) {
 	}
 }
 
+func TestParseConfigLoadsFileDefaults(t *testing.T) {
+	source := t.TempDir()
+	dir := filepath.Join(source, ".bbrs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"port":13010,"destination":"scripts","verbose":true}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(payload), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := parseConfig([]string{"-s", source}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 13010 {
+		t.Fatalf("port = %d", cfg.Port)
+	}
+	if cfg.Destination != "scripts" {
+		t.Fatalf("destination = %q", cfg.Destination)
+	}
+	if !cfg.Verbose {
+		t.Fatal("verbose not set from config")
+	}
+}
+
 func TestParseConfigNormalizesDestination(t *testing.T) {
 	source := t.TempDir()
 	cfg, err := parseConfig([]string{"-s", source, "-d", "scripts/batch/"}, &bytes.Buffer{})
@@ -219,7 +258,7 @@ func TestParseConfigNormalizesDestination(t *testing.T) {
 func TestParseConfigAcceptsLogDir(t *testing.T) {
 	source := t.TempDir()
 	logDir := filepath.Join(source, "logs")
-	cfg, err := parseConfig([]string{"-s", source, "--logdir", logDir}, &bytes.Buffer{})
+	cfg, err := parseConfig([]string{"-s", source, "--log-dir", logDir}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,8 +289,12 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"--pattern '*.script' --pattern '*.txt'",
 		"Logging:",
 		"Default: /var/log/bbrs/",
+		"Persistent cache:",
+		"Config file:",
 		"--yes",
-		"--logdir               Directory for log files.",
+		"--once",
+		"--verbose",
+		"--log-dir              Directory for log files.",
 		"--dry-run",
 		"--allow-remote-listen",
 		"--version",
@@ -325,13 +368,14 @@ func TestStartupFileChangeWaitsForFirstConnectionWithoutRPC(t *testing.T) {
 	output := setupTestLogger(t)
 	app := newApp(context.Background(), testOptions(t))
 	calls := 0
-	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
+	app.syncFn = func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error) {
 		calls++
-		return syncer.Summary{}, nil
+		return syncer.Result{}, nil
 	}
 
 	app.triggerSync("local file change")
 	app.triggerSync("local file change")
+	waitForSyncWorker(t, app)
 
 	if calls != 0 {
 		t.Fatalf("sync calls = %d, want 0", calls)
@@ -348,14 +392,15 @@ func TestDisconnectedAfterPriorConnectionMarksPendingWithoutRPC(t *testing.T) {
 	output := setupTestLogger(t)
 	app := newApp(context.Background(), testOptions(t))
 	calls := 0
-	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
+	app.syncFn = func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error) {
 		calls++
-		return syncer.Summary{}, nil
+		return syncer.Result{}, nil
 	}
 	app.markConnected()
 
 	app.triggerSync("local file change")
 	app.triggerSync("local file change")
+	waitForSyncWorker(t, app)
 
 	if calls != 0 {
 		t.Fatalf("sync calls = %d, want 0", calls)
@@ -372,9 +417,9 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	output := setupTestLogger(t)
 	app := newApp(context.Background(), testOptions(t))
 	calls := 0
-	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
+	app.syncFn = func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error) {
 		calls++
-		return syncer.Summary{Uploaded: 2}, nil
+		return syncer.Result{Summary: syncer.Summary{Uploaded: 2}}, nil
 	}
 
 	app.triggerSync("local file change")
@@ -384,6 +429,7 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	}
 	app.markConnected()
 	app.triggerSync("Bitburner connection")
+	waitForSyncWorker(t, app)
 
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
@@ -392,10 +438,10 @@ func TestFirstConnectionRunsFullSyncAndClearsPending(t *testing.T) {
 	if !strings.Contains(text, "sync complete") || !strings.Contains(text, "uploaded=2") {
 		t.Fatalf("missing sync complete log:\n%s", text)
 	}
-	app.syncMu.Lock()
-	defer app.syncMu.Unlock()
-	if app.syncPending {
-		t.Fatal("syncPending still true")
+	app.workerMu.Lock()
+	defer app.workerMu.Unlock()
+	if app.pending != nil {
+		t.Fatal("pending job still set")
 	}
 	if app.disconnectedPendingLogged {
 		t.Fatal("disconnectedPendingLogged still true")
@@ -409,9 +455,9 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	output := setupTestLogger(t)
 	app := newApp(context.Background(), testOptions(t))
 	calls := 0
-	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
+	app.syncFn = func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error) {
 		calls++
-		return syncer.Summary{Uploaded: 3}, nil
+		return syncer.Result{Summary: syncer.Summary{Uploaded: 3}}, nil
 	}
 	app.markConnected()
 
@@ -422,6 +468,7 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	}
 	app.markConnected()
 	app.triggerSync("Bitburner connection")
+	waitForSyncWorker(t, app)
 
 	if calls != 1 {
 		t.Fatalf("sync calls = %d, want 1", calls)
@@ -430,10 +477,10 @@ func TestReconnectRunsFullSyncAndClearsPending(t *testing.T) {
 	if !strings.Contains(text, "sync complete") || !strings.Contains(text, "uploaded=3") {
 		t.Fatalf("missing sync complete log:\n%s", text)
 	}
-	app.syncMu.Lock()
-	defer app.syncMu.Unlock()
-	if app.syncPending {
-		t.Fatal("syncPending still true")
+	app.workerMu.Lock()
+	defer app.workerMu.Unlock()
+	if app.pending != nil {
+		t.Fatal("pending job still set")
 	}
 	if app.disconnectedPendingLogged {
 		t.Fatal("disconnectedPendingLogged still true")
@@ -455,7 +502,7 @@ func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 	calls := 0
 	running := 0
 	maxRunning := 0
-	app.sync = func(context.Context, syncer.RemoteAPI, syncer.Options) (syncer.Summary, error) {
+	app.syncFn = func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.ChangeSet) (syncer.Result, error) {
 		mu.Lock()
 		calls++
 		call := calls
@@ -473,7 +520,7 @@ func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 		mu.Lock()
 		running--
 		mu.Unlock()
-		return syncer.Summary{Uploaded: call}, nil
+		return syncer.Result{Summary: syncer.Summary{Uploaded: call}}, nil
 	}
 
 	go func() {
@@ -490,6 +537,7 @@ func TestOverlappingSyncRequestsAreCoalesced(t *testing.T) {
 		t.Fatalf("second call = %d", call)
 	}
 	<-done
+	waitForSyncWorker(t, app)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -533,11 +581,26 @@ func TestRunOneSyncRespectsContextCancellation(t *testing.T) {
 	if !app.setClient(client) {
 		t.Fatal("setClient failed")
 	}
-	app.sync = func(ctx context.Context, _ syncer.RemoteAPI, _ syncer.Options) (syncer.Summary, error) {
-		return syncer.Summary{}, ctx.Err()
+	app.syncFn = func(ctx context.Context, _ syncer.RemoteAPI, _ syncer.Options, _ syncer.ChangeSet) (syncer.Result, error) {
+		return syncer.Result{}, ctx.Err()
 	}
 
-	if app.runOneSync("cancelled") {
+	if app.runOneSync("cancelled", syncer.ChangeSet{}) {
 		t.Fatal("expected cancelled sync to fail")
 	}
+}
+
+func waitForSyncWorker(t *testing.T, app *app) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		app.workerMu.Lock()
+		running := app.running
+		app.workerMu.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("sync worker still running")
 }

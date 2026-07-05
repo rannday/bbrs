@@ -4,48 +4,39 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 )
 
-var IgnoredDirNames = []string{
-	".bbrs",
-	".git",
-	"target",
-	"node_modules",
-	"dist",
-	"build",
-	".zed",
-	".vscode",
-	".idea",
-	"coverage",
-	"tmp",
-	"temp",
-}
-
+// FileMetadata describes a remote file returned by getAllFileMetadata.
 type FileMetadata struct {
-	Filename string `json:"filename"`
-	// Bitburner sends Unix epoch milliseconds. The remote_api.md prose docs
-	// describe these as strings, but the game API uses numbers.
-	Atime int64 `json:"atime"`
-	Btime int64 `json:"btime"`
-	Mtime int64 `json:"mtime"`
+	Filename string            `json:"filename"`
+	Atime    FlexibleTimestamp `json:"atime"`
+	Btime    FlexibleTimestamp `json:"btime"`
+	Mtime    FlexibleTimestamp `json:"mtime"`
 }
 
+// RemoteAPI is the Bitburner Remote API surface used by the syncer.
 type RemoteAPI interface {
 	GetAllFileMetadata(ctx context.Context, server string) ([]FileMetadata, error)
 	PushFile(ctx context.Context, server, filename, content string) error
 	DeleteFile(ctx context.Context, server, filename string) error
 }
 
+// Options configures mirror and incremental sync operations.
 type Options struct {
 	Source      string
 	Destination string
 	Host        string
 	Patterns    Patterns
+	Ignored     IgnoredDirs
 	State       *State
+	CachePath   string
 	DryRun      bool
 }
 
+// DesiredFile is a local file that should exist remotely.
 type DesiredFile struct {
 	SourcePath string
 	Relative   string
@@ -53,19 +44,35 @@ type DesiredFile struct {
 	Stamp      FileStamp
 }
 
+// Plan is the upload and delete set for a full mirror.
 type Plan struct {
 	Desired []DesiredFile
 	Deletes []string
 	Ignored int
 }
 
+// Summary counts sync operations performed or planned.
 type Summary struct {
 	Uploaded int
 	Skipped  int
 	Deleted  int
 	Ignored  int
+	Failed   int
 }
 
+// Result combines summary counts with per-file errors from best-effort sync.
+type Result struct {
+	Summary Summary
+	Errors  []error
+}
+
+// ChangeSet lists relative source paths changed or deleted since last watch event.
+type ChangeSet struct {
+	Modified []string
+	Deleted  []string
+}
+
+// RemoteNames extracts filenames from remote metadata.
 func RemoteNames(metadata []FileMetadata) []string {
 	names := make([]string, 0, len(metadata))
 	for _, entry := range metadata {
@@ -74,8 +81,9 @@ func RemoteNames(metadata []FileMetadata) []string {
 	return names
 }
 
-func BuildPlan(source, destination string, patterns Patterns, remoteNames []string) (Plan, error) {
-	desired, ignored, err := BuildDesired(source, destination, patterns)
+// BuildPlan builds the full mirror upload and delete plan.
+func BuildPlan(source, destination string, patterns Patterns, ignored IgnoredDirs, remoteNames []string) (Plan, error) {
+	desired, ignoredCount, err := BuildDesired(source, destination, patterns, ignored)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -87,10 +95,11 @@ func BuildPlan(source, destination string, patterns Patterns, remoteNames []stri
 	return Plan{
 		Desired: desired,
 		Deletes: deletes,
-		Ignored: ignored,
+		Ignored: ignoredCount,
 	}, nil
 }
 
+// BuildDeletes returns stale remote files under destination that match patterns.
 func BuildDeletes(destination string, patterns Patterns, desired []DesiredFile, remoteNames []string) ([]string, error) {
 	desiredSet := make(map[string]struct{}, len(desired))
 	for _, file := range desired {
@@ -120,13 +129,14 @@ func BuildDeletes(destination string, patterns Patterns, desired []DesiredFile, 
 	return deletes, nil
 }
 
-func BuildDesired(source, destination string, patterns Patterns) ([]DesiredFile, int, error) {
+// BuildDesired walks source and returns files that should exist remotely.
+func BuildDesired(source, destination string, patterns Patterns, ignored IgnoredDirs) ([]DesiredFile, int, error) {
 	files := make([]DesiredFile, 0)
-	ignored := 0
+	ignoredCount := 0
 
-	err := WalkSource(source, patterns, func(entry SourceEntry) error {
+	err := WalkSource(source, patterns, ignored, func(entry SourceEntry) error {
 		if !patterns.Match(entry.Relative) {
-			ignored++
+			ignoredCount++
 			return nil
 		}
 		remote, err := JoinDestinationFile(destination, entry.Relative)
@@ -142,83 +152,191 @@ func BuildDesired(source, destination string, patterns Patterns) ([]DesiredFile,
 		return nil
 	})
 	if err != nil {
-		return nil, ignored, err
+		return nil, ignoredCount, err
 	}
 
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Remote < files[j].Remote
 	})
-	return files, ignored, nil
+	return files, ignoredCount, nil
 }
 
-func Mirror(ctx context.Context, api RemoteAPI, options Options) (Summary, error) {
+// Mirror performs a full best-effort mirror sync.
+func Mirror(ctx context.Context, api RemoteAPI, options Options) (Result, error) {
 	if err := ctx.Err(); err != nil {
-		return Summary{}, err
+		return Result{}, err
 	}
 
 	remoteMetadata, err := api.GetAllFileMetadata(ctx, options.Host)
 	if err != nil {
-		return Summary{}, fmt.Errorf("get remote file metadata: %w", err)
+		return Result{}, fmt.Errorf("get remote file metadata: %w", err)
 	}
 
-	plan, err := BuildPlan(options.Source, options.Destination, options.Patterns, RemoteNames(remoteMetadata))
+	plan, err := BuildPlan(options.Source, options.Destination, options.Patterns, options.Ignored, RemoteNames(remoteMetadata))
 	if err != nil {
-		return Summary{}, err
+		return Result{}, err
 	}
 
 	remotePresent := remotePresentSet(remoteMetadata)
-	uploaded := 0
-	skipped := 0
-	for _, file := range plan.Desired {
+	result := applyUploads(ctx, api, options, plan.Desired, remotePresent)
+	deleteResult := applyDeletes(ctx, api, options, plan.Deletes)
+	result.Summary.Deleted = deleteResult.Summary.Deleted
+	result.Summary.Failed += deleteResult.Summary.Failed
+	result.Errors = append(result.Errors, deleteResult.Errors...)
+	result.Summary.Ignored = plan.Ignored
+	return result, nil
+}
+
+// SyncChanges applies incremental uploads and deletes for known local changes.
+// Falls back to full mirror when changes are empty or incremental work fails early.
+func SyncChanges(ctx context.Context, api RemoteAPI, options Options, changes ChangeSet) (Result, error) {
+	if len(changes.Modified) == 0 && len(changes.Deleted) == 0 {
+		return Mirror(ctx, api, options)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+
+	modified := uniqueSorted(changes.Modified)
+	deleted := uniqueSorted(changes.Deleted)
+
+	desired := make([]DesiredFile, 0, len(modified))
+	for _, relative := range modified {
+		if !options.Patterns.Match(relative) {
+			continue
+		}
+		sourcePath := filepath.Join(options.Source, filepath.FromSlash(relative))
+		info, err := os.Stat(sourcePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return Result{}, fmt.Errorf("stat %s: %w", sourcePath, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		remote, err := JoinDestinationFile(options.Destination, relative)
+		if err != nil {
+			return Result{}, err
+		}
+		desired = append(desired, DesiredFile{
+			SourcePath: sourcePath,
+			Relative:   relative,
+			Remote:     remote,
+			Stamp:      FileStampFromInfo(info),
+		})
+	}
+
+	remoteDeletes := make([]string, 0, len(deleted))
+	for _, relative := range deleted {
+		if !options.Patterns.Match(relative) {
+			continue
+		}
+		remote, err := JoinDestinationFile(options.Destination, relative)
+		if err != nil {
+			return Result{}, err
+		}
+		remoteDeletes = append(remoteDeletes, remote)
+	}
+
+	// Incremental uploads still need remote presence for skip logic.
+	remoteMetadata, err := api.GetAllFileMetadata(ctx, options.Host)
+	if err != nil {
+		return Result{}, fmt.Errorf("get remote file metadata: %w", err)
+	}
+	remotePresent := remotePresentSet(remoteMetadata)
+
+	result := applyUploads(ctx, api, options, desired, remotePresent)
+	deleteResult := applyDeletes(ctx, api, options, remoteDeletes)
+	result.Summary.Deleted = deleteResult.Summary.Deleted
+	result.Summary.Failed += deleteResult.Summary.Failed
+	result.Errors = append(result.Errors, deleteResult.Errors...)
+	return result, nil
+}
+
+func applyUploads(ctx context.Context, api RemoteAPI, options Options, desired []DesiredFile, remotePresent map[string]struct{}) Result {
+	result := Result{Summary: Summary{}}
+	dirty := false
+
+	for _, file := range desired {
 		if err := ctx.Err(); err != nil {
-			return Summary{}, err
+			result.Errors = append(result.Errors, err)
+			break
 		}
 		_, present := remotePresent[file.Remote]
 		if present && options.State != nil && !options.State.ShouldUpload(file.Remote, file.Stamp) {
-			skipped++
+			result.Summary.Skipped++
 			continue
 		}
 		if options.DryRun {
-			uploaded++
+			result.Summary.Uploaded++
 			continue
 		}
 		content, err := os.ReadFile(file.SourcePath)
 		if err != nil {
-			return Summary{}, fmt.Errorf("read %s: %w", file.SourcePath, err)
+			result.Summary.Failed++
+			result.Errors = append(result.Errors, fmt.Errorf("read %s: %w", file.SourcePath, err))
+			continue
 		}
 		if err := api.PushFile(ctx, options.Host, file.Remote, string(content)); err != nil {
-			return Summary{}, fmt.Errorf("upload %s: %w", file.Remote, err)
+			result.Summary.Failed++
+			result.Errors = append(result.Errors, fmt.Errorf("upload %s: %w", file.Remote, err))
+			continue
 		}
 		if options.State != nil {
 			options.State.RememberUpload(file.Remote, file.Stamp)
+			dirty = true
 		}
-		uploaded++
+		result.Summary.Uploaded++
 	}
 
-	deleted := 0
-	for _, remote := range plan.Deletes {
+	if dirty {
+		result.Errors = append(result.Errors, saveCache(options)...)
+	}
+	return result
+}
+
+func applyDeletes(ctx context.Context, api RemoteAPI, options Options, deletes []string) Result {
+	result := Result{Summary: Summary{}}
+	dirty := false
+
+	for _, remote := range deletes {
 		if err := ctx.Err(); err != nil {
-			return Summary{}, err
+			result.Errors = append(result.Errors, err)
+			break
 		}
 		if options.DryRun {
-			deleted++
+			result.Summary.Deleted++
 			continue
 		}
 		if err := api.DeleteFile(ctx, options.Host, remote); err != nil {
-			return Summary{}, fmt.Errorf("delete %s: %w", remote, err)
+			result.Summary.Failed++
+			result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", remote, err))
+			continue
 		}
 		if options.State != nil {
 			options.State.ForgetRemote(remote)
+			dirty = true
 		}
-		deleted++
+		result.Summary.Deleted++
 	}
 
-	return Summary{
-		Uploaded: uploaded,
-		Skipped:  skipped,
-		Deleted:  deleted,
-		Ignored:  plan.Ignored,
-	}, nil
+	if dirty {
+		result.Errors = append(result.Errors, saveCache(options)...)
+	}
+	return result
+}
+
+func saveCache(options Options) []error {
+	if options.State == nil || options.CachePath == "" || options.DryRun {
+		return nil
+	}
+	if err := options.State.Save(options.CachePath); err != nil {
+		return []error{fmt.Errorf("save cache: %w", err)}
+	}
+	return nil
 }
 
 func remotePresentSet(metadata []FileMetadata) map[string]struct{} {
@@ -233,31 +351,23 @@ func remotePresentSet(metadata []FileMetadata) map[string]struct{} {
 	return present
 }
 
-func IsIgnoredDir(name string) bool {
-	for _, ignored := range IgnoredDirNames {
-		if equalFoldASCII(name, ignored) {
-			return true
-		}
+func uniqueSorted(values []string) []string {
+	if len(values) == 0 {
+		return nil
 	}
-	return false
-}
-
-func equalFoldASCII(left, right string) bool {
-	if len(left) != len(right) {
-		return false
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = NormalizeSlashes(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
-	for i := range left {
-		l := left[i]
-		r := right[i]
-		if l >= 'A' && l <= 'Z' {
-			l += 'a' - 'A'
-		}
-		if r >= 'A' && r <= 'Z' {
-			r += 'a' - 'A'
-		}
-		if l != r {
-			return false
-		}
-	}
-	return true
+	sort.Strings(out)
+	return out
 }

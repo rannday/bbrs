@@ -1,23 +1,21 @@
 package watch
 
-import (
-	"context"
-	"time"
+import "github.com/rannday/bbrs/internal/syncer"
 
-	"github.com/rannday/bbrs/internal/syncer"
-)
-
+// FileState tracks one source file in a snapshot.
 type FileState struct {
 	Size    int64
 	ModTime int64
 	Matched bool
 }
 
+// Snapshot maps cleaned relative paths to file state.
 type Snapshot map[string]FileState
 
-func SnapshotSource(source string, patterns syncer.Patterns) (Snapshot, error) {
+// SnapshotSource captures the current source tree state.
+func SnapshotSource(source string, patterns syncer.Patterns, ignored syncer.IgnoredDirs) (Snapshot, error) {
 	snapshot := make(Snapshot)
-	err := syncer.WalkSource(source, patterns, func(entry syncer.SourceEntry) error {
+	err := syncer.WalkSource(source, patterns, ignored, func(entry syncer.SourceEntry) error {
 		snapshot[entry.Relative] = FileState{
 			Size:    entry.Info.Size(),
 			ModTime: entry.Info.ModTime().UnixNano(),
@@ -28,9 +26,10 @@ func SnapshotSource(source string, patterns syncer.Patterns) (Snapshot, error) {
 	return snapshot, err
 }
 
-func HasRelevantChange(previous, current Snapshot) bool {
+// DiffSnapshots returns modified and deleted relative paths with matched-file relevance.
+func DiffSnapshots(previous, current Snapshot) syncer.ChangeSet {
 	if previous == nil {
-		return false
+		return syncer.ChangeSet{}
 	}
 
 	keys := make(map[string]struct{}, len(previous)+len(current))
@@ -41,64 +40,27 @@ func HasRelevantChange(previous, current Snapshot) bool {
 		keys[key] = struct{}{}
 	}
 
+	changes := syncer.ChangeSet{}
 	for key := range keys {
 		oldState, hadOld := previous[key]
 		newState, hasNew := current[key]
 		if hadOld && hasNew && oldState == newState {
 			continue
 		}
-		if oldState.Matched || newState.Matched {
-			return true
+		if !oldState.Matched && !newState.Matched {
+			continue
+		}
+		if hasNew {
+			changes.Modified = append(changes.Modified, key)
+		} else if hadOld {
+			changes.Deleted = append(changes.Deleted, key)
 		}
 	}
-	return false
+	return changes
 }
 
-func Poll(ctx context.Context, source string, patterns syncer.Patterns, interval, debounce time.Duration, onChange func()) error {
-	var previous Snapshot
-	var seeded bool
-	var debounceTimer *time.Timer
-	var debounceC <-chan time.Time
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
-			return ctx.Err()
-		case <-ticker.C:
-			current, err := SnapshotSource(source, patterns)
-			if err != nil {
-				return err
-			}
-			if !seeded {
-				previous = current
-				seeded = true
-				continue
-			}
-			if HasRelevantChange(previous, current) {
-				if debounceTimer == nil {
-					debounceTimer = time.NewTimer(debounce)
-					debounceC = debounceTimer.C
-				} else {
-					if !debounceTimer.Stop() {
-						select {
-						case <-debounceTimer.C:
-						default:
-						}
-					}
-					debounceTimer.Reset(debounce)
-				}
-			}
-			previous = current
-		case <-debounceC:
-			debounceC = nil
-			debounceTimer = nil
-			onChange()
-		}
-	}
+// HasRelevantChange reports whether any matched file changed between snapshots.
+func HasRelevantChange(previous, current Snapshot) bool {
+	changes := DiffSnapshots(previous, current)
+	return len(changes.Modified) > 0 || len(changes.Deleted) > 0
 }

@@ -24,6 +24,19 @@ func TestHasRelevantChangeDetectsCreateModifyDelete(t *testing.T) {
 	}
 }
 
+func TestDiffSnapshotsReportsModifiedAndDeleted(t *testing.T) {
+	previous := Snapshot{"main.js": {Size: 1, ModTime: 1, Matched: true}}
+	changes := DiffSnapshots(previous, Snapshot{"main.js": {Size: 2, ModTime: 2, Matched: true}})
+	if len(changes.Modified) != 1 || changes.Modified[0] != "main.js" {
+		t.Fatalf("modified = %#v", changes.Modified)
+	}
+
+	changes = DiffSnapshots(previous, Snapshot{})
+	if len(changes.Deleted) != 1 || changes.Deleted[0] != "main.js" {
+		t.Fatalf("deleted = %#v", changes.Deleted)
+	}
+}
+
 func TestHasRelevantChangeIgnoresUnmatchedFiles(t *testing.T) {
 	previous := Snapshot{"README.md": {Size: 1, ModTime: 1, Matched: false}}
 	current := Snapshot{"README.md": {Size: 2, ModTime: 2, Matched: false}}
@@ -40,7 +53,7 @@ func TestSnapshotSourceUsesCleanedRelativePaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := SnapshotSource(root, patterns)
+	snapshot, err := SnapshotSource(root, patterns, syncer.NewIgnoredDirs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +70,7 @@ func TestPollSeedsBaselineWithoutTriggeringChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ignored := syncer.NewIgnoredDirs(nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,7 +78,7 @@ func TestPollSeedsBaselineWithoutTriggeringChange(t *testing.T) {
 	var changes atomic.Int32
 	done := make(chan struct{})
 	go func() {
-		_ = Poll(ctx, root, patterns, 20*time.Millisecond, 10*time.Millisecond, func() {
+		_ = Poll(ctx, root, patterns, ignored, 20*time.Millisecond, 10*time.Millisecond, func(syncer.ChangeSet) {
 			changes.Add(1)
 		})
 		close(done)
@@ -88,6 +102,7 @@ func TestPollDetectsMatchedFileChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ignored := syncer.NewIgnoredDirs(nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -95,8 +110,10 @@ func TestPollDetectsMatchedFileChanges(t *testing.T) {
 	var changes atomic.Int32
 	done := make(chan struct{})
 	go func() {
-		_ = Poll(ctx, root, patterns, 20*time.Millisecond, 10*time.Millisecond, func() {
-			changes.Add(1)
+		_ = Poll(ctx, root, patterns, ignored, 20*time.Millisecond, 10*time.Millisecond, func(changeset syncer.ChangeSet) {
+			if len(changeset.Modified) > 0 || len(changeset.Deleted) > 0 {
+				changes.Add(1)
+			}
 		})
 		close(done)
 	}()

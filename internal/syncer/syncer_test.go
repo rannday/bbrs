@@ -85,6 +85,16 @@ func TestPathNormalizationConvertsBackslashes(t *testing.T) {
 	}
 }
 
+func TestPathNormalizationTrimsTrailingSlashes(t *testing.T) {
+	got, err := NormalizeRemotePath("scripts/batch/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "scripts/batch" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestDestinationPathJoining(t *testing.T) {
 	cases := []struct {
 		destination string
@@ -116,12 +126,32 @@ func TestIgnoredDirsSkippedCaseInsensitively(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired, _, err := BuildDesired(root, "", patterns)
+	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := remotePaths(desired)
 	want := []string{"src/main.js"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestExtraIgnoredDirsWork(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "vendor", "dep.js"), "ignored")
+	writeFile(t, filepath.Join(root, "main.js"), "ok")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs([]string{"vendor"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := remotePaths(desired)
+	want := []string{"main.js"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -146,7 +176,7 @@ func TestSymlinkedPathsAreSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired, _, err := BuildDesired(root, "", patterns)
+	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +196,7 @@ func TestSyncPlanOrderingIsDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := BuildPlan(root, "scripts", patterns, nil)
+	plan, err := BuildPlan(root, "scripts", patterns, NewIgnoredDirs(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,18 +223,19 @@ func TestMirrorDeletesOnlyMatchingStaleFilesUnderDestination(t *testing.T) {
 		{Filename: "scripts/data.json"},
 		{Filename: "scripts/types.d.ts"},
 	}}
-	summary, err := Mirror(context.Background(), api, Options{
+	result, err := Mirror(context.Background(), api, Options{
 		Source:      root,
 		Destination: "scripts",
 		Host:        "home",
 		Patterns:    patterns,
+		Ignored:     NewIgnoredDirs(nil),
 		State:       NewState(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Uploaded != 1 || summary.Skipped != 0 || summary.Deleted != 1 || summary.Ignored != 1 {
-		t.Fatalf("summary = %+v", summary)
+	if result.Summary.Uploaded != 1 || result.Summary.Skipped != 0 || result.Summary.Deleted != 1 || result.Summary.Ignored != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
 	}
 	if !reflect.DeepEqual(api.deleted, []string{"scripts/old.js"}) {
 		t.Fatalf("deleted = %v", api.deleted)
@@ -229,6 +260,7 @@ func TestMirrorSkipsUnchangedUploads(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
 		State:    state,
 	}
 
@@ -236,16 +268,16 @@ func TestMirrorSkipsUnchangedUploads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Uploaded != 1 || first.Skipped != 0 {
-		t.Fatalf("first summary = %+v", first)
+	if first.Summary.Uploaded != 1 || first.Summary.Skipped != 0 {
+		t.Fatalf("first summary = %+v", first.Summary)
 	}
 
 	second, err := Mirror(context.Background(), api, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Uploaded != 0 || second.Skipped != 1 {
-		t.Fatalf("second summary = %+v", second)
+	if second.Summary.Uploaded != 0 || second.Summary.Skipped != 1 {
+		t.Fatalf("second summary = %+v", second.Summary)
 	}
 	if len(api.uploaded) != 1 {
 		t.Fatalf("uploaded = %v", api.uploaded)
@@ -266,6 +298,7 @@ func TestMirrorReuploadsCachedFileWhenRemoteMissing(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
 		State:    state,
 	}
 
@@ -273,8 +306,8 @@ func TestMirrorReuploadsCachedFileWhenRemoteMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Uploaded != 1 || first.Skipped != 0 {
-		t.Fatalf("first summary = %+v", first)
+	if first.Summary.Uploaded != 1 || first.Summary.Skipped != 0 {
+		t.Fatalf("first summary = %+v", first.Summary)
 	}
 
 	api.remoteMetadata = nil
@@ -282,8 +315,8 @@ func TestMirrorReuploadsCachedFileWhenRemoteMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Uploaded != 1 || second.Skipped != 0 {
-		t.Fatalf("second summary = %+v", second)
+	if second.Summary.Uploaded != 1 || second.Summary.Skipped != 0 {
+		t.Fatalf("second summary = %+v", second.Summary)
 	}
 	if !reflect.DeepEqual(api.uploaded, []string{"main.js", "main.js"}) {
 		t.Fatalf("uploaded = %v", api.uploaded)
@@ -304,6 +337,7 @@ func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
 		State:    NewState(),
 	}
 	if _, err := Mirror(context.Background(), api, options); err != nil {
@@ -311,12 +345,12 @@ func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 	}
 
 	writeFile(t, path, "v2")
-	summary, err := Mirror(context.Background(), api, options)
+	result, err := Mirror(context.Background(), api, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Uploaded != 1 || summary.Skipped != 0 {
-		t.Fatalf("summary = %+v", summary)
+	if result.Summary.Uploaded != 1 || result.Summary.Skipped != 0 {
+		t.Fatalf("summary = %+v", result.Summary)
 	}
 	if len(api.uploaded) != 2 {
 		t.Fatalf("uploaded = %v", api.uploaded)
@@ -348,18 +382,19 @@ func TestMirrorDryRunDoesNotUploadDeleteOrMutateCache(t *testing.T) {
 		{Filename: "/invalid.js"},
 	}}
 
-	summary, err := Mirror(context.Background(), api, Options{
+	result, err := Mirror(context.Background(), api, Options{
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
 		State:    state,
 		DryRun:   true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Uploaded != 1 || summary.Skipped != 1 || summary.Deleted != 1 || summary.Ignored != 1 {
-		t.Fatalf("summary = %+v", summary)
+	if result.Summary.Uploaded != 1 || result.Summary.Skipped != 1 || result.Summary.Deleted != 1 || result.Summary.Ignored != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
 	}
 	if len(api.uploaded) != 0 {
 		t.Fatalf("uploaded = %v", api.uploaded)
@@ -389,6 +424,7 @@ func TestMirrorClearsUploadCacheOnDelete(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
 		State:    state,
 	}
 	if _, err := Mirror(context.Background(), api, options); err != nil {
@@ -402,10 +438,88 @@ func TestMirrorClearsUploadCacheOnDelete(t *testing.T) {
 	}
 }
 
+func TestMirrorContinuesOnIndividualFileErrors(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "good.js"), "ok")
+	writeFile(t, filepath.Join(root, "bad.js"), "bad")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{
+		remoteMetadata: nil,
+		pushErrFor:     map[string]error{"bad.js": os.ErrPermission},
+	}
+	result, err := Mirror(context.Background(), api, Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
+		State:    NewState(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Uploaded != 1 || result.Summary.Failed != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+	if len(result.Errors) != 1 {
+		t.Fatalf("errors = %v", result.Errors)
+	}
+}
+
+func TestSyncChangesUploadsModifiedFile(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.js"), "v2")
+
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "main.js"}}}
+	result, err := SyncChanges(context.Background(), api, Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
+		State:    NewState(),
+	}, ChangeSet{Modified: []string{"main.js"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Uploaded != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+}
+
+func TestSyncChangesDeletesRemovedFile(t *testing.T) {
+	root := t.TempDir()
+	patterns, err := NewPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{remoteMetadata: []FileMetadata{{Filename: "old.js"}}}
+	result, err := SyncChanges(context.Background(), api, Options{
+		Source:   root,
+		Host:     "home",
+		Patterns: patterns,
+		Ignored:  NewIgnoredDirs(nil),
+		State:    NewState(),
+	}, ChangeSet{Deleted: []string{"old.js"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Deleted != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+}
+
 type fakeAPI struct {
 	remoteMetadata []FileMetadata
 	uploaded       []string
 	deleted        []string
+	pushErrFor     map[string]error
 }
 
 func (api *fakeAPI) GetAllFileMetadata(_ context.Context, _ string) ([]FileMetadata, error) {
@@ -413,6 +527,11 @@ func (api *fakeAPI) GetAllFileMetadata(_ context.Context, _ string) ([]FileMetad
 }
 
 func (api *fakeAPI) PushFile(_ context.Context, _, filename, _ string) error {
+	if api.pushErrFor != nil {
+		if err := api.pushErrFor[filename]; err != nil {
+			return err
+		}
+	}
 	api.uploaded = append(api.uploaded, filename)
 	return nil
 }

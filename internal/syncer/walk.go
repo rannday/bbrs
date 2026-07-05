@@ -5,13 +5,15 @@ import (
 	"path/filepath"
 )
 
+// SourceEntry is one regular file discovered under the source directory.
 type SourceEntry struct {
 	SourcePath string
 	Relative   string
 	Info       fs.FileInfo
 }
 
-func WalkSource(source string, patterns Patterns, visit func(SourceEntry) error) error {
+// WalkSource visits regular files under source, skipping ignored directories and symlinks.
+func WalkSource(source string, patterns Patterns, ignored IgnoredDirs, visit func(SourceEntry) error) error {
 	return filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -23,7 +25,7 @@ func WalkSource(source string, patterns Patterns, visit func(SourceEntry) error)
 			return nil
 		}
 		if entry.IsDir() {
-			if current != source && IsIgnoredDir(entry.Name()) {
+			if current != source && ignored.IsIgnored(entry.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

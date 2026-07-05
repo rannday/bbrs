@@ -18,7 +18,7 @@ const (
 
 var unixSystemLogDir = "/var/log/bbrs"
 
-// ResolveLogPath picks the log file path from an explicit --logdir value and defaults.
+// ResolveLogPath picks the log file path from an explicit --log-dir value and defaults.
 func ResolveLogPath(logdir, source string) (string, error) {
 	dir, err := resolveLogDir(logdir, source)
 	if err != nil {
@@ -67,13 +67,13 @@ func logFileName() string {
 }
 
 // Configure installs the global logger with console and rotating file output.
-func Configure(logPath string) error {
+func Configure(logPath string, level slog.Level) error {
 	return logx.Configure(logx.Config{
-		Level:              slog.LevelInfo,
-		Console:            true,
-		FilePath:           logPath,
-		FileMaxSizeBytes:   defaultMaxSizeBytes,
-		FileMaxBackups:     defaultMaxBackups,
-		StacktraceLevel:    slog.LevelError,
+		Level:            level,
+		Console:          true,
+		FilePath:         logPath,
+		FileMaxSizeBytes: defaultMaxSizeBytes,
+		FileMaxBackups:   defaultMaxBackups,
+		StacktraceLevel:  slog.LevelError,
 	})
 }
