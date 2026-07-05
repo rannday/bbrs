@@ -4,5 +4,6 @@
 *.out
 .bbrs/
 dist/
+tmp/
 coverage.out
 coverage.html
