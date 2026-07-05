@@ -1,8 +1,13 @@
 package syncer
 
-// DefaultIgnoredDirNames are directory names skipped during source walks.
-// Matched case-insensitively against the base directory name.
-var DefaultIgnoredDirNames = []string{
+import (
+	"fmt"
+	"path"
+	"strings"
+)
+
+// DefaultIgnorePatterns are path patterns skipped during source walks.
+var DefaultIgnorePatterns = []string{
 	".bbrs",
 	".git",
 	"target",
@@ -17,59 +22,50 @@ var DefaultIgnoredDirNames = []string{
 	"temp",
 }
 
-// IgnoredDirs holds directory names to skip during source walks.
-type IgnoredDirs struct {
-	names []string
+// IgnoredPatterns holds filename and directory patterns to skip during source walks.
+type IgnoredPatterns struct {
+	patterns []string
 }
 
-// NewIgnoredDirs returns ignored dirs from defaults plus any extras.
-func NewIgnoredDirs(extra []string) IgnoredDirs {
-	names := append([]string{}, DefaultIgnoredDirNames...)
-	for _, name := range extra {
-		if name == "" {
-			continue
+// NewIgnoredPatterns returns ignored patterns from defaults plus any extras.
+func NewIgnoredPatterns(extra []string) (IgnoredPatterns, error) {
+	patterns := append([]string{}, DefaultIgnorePatterns...)
+	for _, raw := range extra {
+		for _, part := range strings.Split(raw, ",") {
+			pattern := strings.TrimSpace(part)
+			if pattern == "" {
+				continue
+			}
+			if _, err := path.Match(pattern, "x"); err != nil {
+				return IgnoredPatterns{}, fmt.Errorf("invalid ignore pattern %q: %w", pattern, err)
+			}
+			patterns = append(patterns, pattern)
 		}
-		names = append(names, name)
 	}
-	return IgnoredDirs{names: names}
+	return IgnoredPatterns{patterns: patterns}, nil
 }
 
-// IsIgnored reports whether a directory base name should be skipped.
-func (ignored IgnoredDirs) IsIgnored(name string) bool {
-	for _, candidate := range ignored.names {
-		if equalFoldASCII(name, candidate) {
+// IsIgnored reports whether a source-relative path or base name should be skipped.
+func (ignored IgnoredPatterns) IsIgnored(name string) bool {
+	normalized := NormalizeSlashes(name)
+	if normalized == "" {
+		return false
+	}
+	base := path.Base(normalized)
+	for _, pattern := range ignored.patterns {
+		if matchIgnorePattern(pattern, normalized) || matchIgnorePattern(pattern, base) {
 			return true
 		}
 	}
 	return false
 }
 
-// Names returns a copy of configured ignored directory names.
-func (ignored IgnoredDirs) Names() []string {
-	return append([]string{}, ignored.names...)
+// Patterns returns a copy of configured ignore patterns.
+func (ignored IgnoredPatterns) Patterns() []string {
+	return append([]string{}, ignored.patterns...)
 }
 
-// IsIgnoredDir reports whether name matches the default ignored set.
-func IsIgnoredDir(name string) bool {
-	return NewIgnoredDirs(nil).IsIgnored(name)
-}
-
-func equalFoldASCII(left, right string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		l := left[i]
-		r := right[i]
-		if l >= 'A' && l <= 'Z' {
-			l += 'a' - 'A'
-		}
-		if r >= 'A' && r <= 'Z' {
-			r += 'a' - 'A'
-		}
-		if l != r {
-			return false
-		}
-	}
-	return true
+func matchIgnorePattern(pattern, value string) bool {
+	matched, err := path.Match(strings.ToLower(pattern), strings.ToLower(value))
+	return err == nil && matched
 }

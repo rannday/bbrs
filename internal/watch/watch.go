@@ -16,7 +16,7 @@ type ChangeHandler func(changes syncer.ChangeSet)
 
 // Poll watches source for matching file changes using fsnotify with polling fallback.
 // onChange receives debounced ChangeSet values; empty sets mean "rescan everything".
-func Poll(ctx context.Context, source string, patterns syncer.Patterns, ignored syncer.IgnoredDirs, interval, debounce time.Duration, onChange ChangeHandler) error {
+func Poll(ctx context.Context, source string, patterns syncer.Patterns, ignored syncer.IgnoredPatterns, interval, debounce time.Duration, onChange ChangeHandler) error {
 	if onChange == nil {
 		onChange = func(syncer.ChangeSet) {}
 	}
@@ -127,7 +127,7 @@ func Poll(ctx context.Context, source string, patterns syncer.Patterns, ignored 
 	}
 }
 
-func addWatchTree(watcher *fsnotify.Watcher, root string, ignored syncer.IgnoredDirs) error {
+func addWatchTree(watcher *fsnotify.Watcher, root string, ignored syncer.IgnoredPatterns) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -135,8 +135,14 @@ func addWatchTree(watcher *fsnotify.Watcher, root string, ignored syncer.Ignored
 		if !entry.IsDir() {
 			return nil
 		}
-		if path != root && ignored.IsIgnored(entry.Name()) {
-			return filepath.SkipDir
+		if path != root {
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			if ignored.IsIgnored(filepath.ToSlash(rel)) {
+				return filepath.SkipDir
+			}
 		}
 		if err := watcher.Add(path); err != nil {
 			return err
@@ -145,7 +151,7 @@ func addWatchTree(watcher *fsnotify.Watcher, root string, ignored syncer.Ignored
 	})
 }
 
-func changesFromEvent(source string, patterns syncer.Patterns, ignored syncer.IgnoredDirs, event fsnotify.Event) (syncer.ChangeSet, error) {
+func changesFromEvent(source string, patterns syncer.Patterns, ignored syncer.IgnoredPatterns, event fsnotify.Event) (syncer.ChangeSet, error) {
 	rel, err := relativeClean(source, event.Name)
 	if err != nil {
 		return syncer.ChangeSet{}, err
@@ -153,7 +159,7 @@ func changesFromEvent(source string, patterns syncer.Patterns, ignored syncer.Ig
 	if rel == "" {
 		return syncer.ChangeSet{}, nil
 	}
-	if ignoredPath(source, rel, ignored) {
+	if ignoredPath(rel, ignored) {
 		return syncer.ChangeSet{}, nil
 	}
 
@@ -194,26 +200,21 @@ func relativeClean(source, path string) (string, error) {
 	return syncer.NormalizeSlashes(filepath.ToSlash(rel)), nil
 }
 
-func ignoredPath(source, relative string, ignored syncer.IgnoredDirs) bool {
-	parts := strings.Split(relative, "/")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		if ignored.IsIgnored(part) {
-			return true
-		}
+func ignoredPath(relative string, ignored syncer.IgnoredPatterns) bool {
+	if ignored.IsIgnored(relative) {
+		return true
 	}
-	dir := filepath.Join(source, filepath.FromSlash(relative))
-	for {
-		parent := filepath.Dir(dir)
-		if parent == dir || !strings.HasPrefix(parent, source) {
-			break
+	parts := strings.Split(relative, "/")
+	current := ""
+	for _, part := range parts[:len(parts)-1] {
+		if current == "" {
+			current = part
+		} else {
+			current += "/" + part
 		}
-		if ignored.IsIgnored(filepath.Base(parent)) {
+		if ignored.IsIgnored(current) {
 			return true
 		}
-		dir = parent
 	}
 	return false
 }

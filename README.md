@@ -28,10 +28,10 @@ make install
 ./bbrs -s ./src
 ./bbrs -s ./src -d scripts
 ./bbrs -s ./src --host home --pattern '*.txt'
+./bbrs -s ./src --ignore dist --ignore tmp
 ./bbrs -s ./src -l 127.0.0.1 -p 12525
-./bbrs -s ./src --dry-run
-./bbrs -s ./src --once
 ./bbrs -s ./src --verbose
+./bbrs -v
 ```
 
 `bbrs` starts a websocket server. In Bitburner, open `Options -> Remote API`, set host `127.0.0.1` and port `12525`, then connect.
@@ -42,13 +42,11 @@ On first connection, `bbrs` performs a full sync. It keeps running and watches t
 
 On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, `ignored`, and `failed` counts. Unchanged local files are skipped using a persistent upload cache in `<source>/.bbrs/cache.json` when the remote metadata still contains the file, so a remotely deleted file is uploaded again on the next sync.
 
-`--dry-run` still requires a Bitburner Remote API connection because it reads remote metadata, but it does not call `pushFile`, does not call `deleteFile`, and does not update the local upload cache. Counts mean would-upload, would-skip, would-delete, and ignored.
-
-`--once` waits for one successful sync after Bitburner connects, then exits.
-
 `--verbose` enables debug logging.
 
-By default, `--listen` accepts only loopback addresses such as `127.0.0.1`, `::1`, and `localhost`. Use `--allow-remote-listen` to bind a non-loopback address such as `0.0.0.0`. This can let remote browser origins connect and trigger destructive sync operations.
+`-v, --version` prints the version and exits.
+
+`--listen` defaults to `127.0.0.1`. If you set another listen address, `bbrs` uses it.
 
 ## Config File
 
@@ -63,9 +61,8 @@ Example `config.json`:
   "destination": "scripts",
   "host": "home",
   "patterns": ["*.txt", "*.ns"],
-  "ignored_dirs": ["vendor"],
-  "verbose": false,
-  "once": false
+  "ignore": ["vendor", "tmp,*.map"],
+  "verbose": false
 }
 ```
 
@@ -77,7 +74,7 @@ port = 12525
 destination = "scripts"
 host = "home"
 patterns = ["*.txt", "*.ns"]
-ignored_dirs = ["vendor"]
+ignore = ["vendor", "tmp,*.map"]
 ```
 
 ## Persistent Cache
@@ -125,12 +122,41 @@ Default included files:
 
 Patterns use Go `path.Match` shell-style glob rules and match slash-normalized relative paths and base filenames.
 
+## Ignore Patterns
+
+Default ignored paths:
+
+```text
+.bbrs
+.git
+target
+node_modules
+dist
+build
+.zed
+.vscode
+.idea
+coverage
+tmp
+temp
+```
+
+`--ignore` expands the default ignore set. It does not replace defaults. Repeated and comma-separated patterns both work.
+
+```sh
+./bbrs -s ./src --ignore vendor
+./bbrs -s ./src --ignore 'dist,tmp,*.map'
+./bbrs -s ./src --ignore vendor --ignore '*.map'
+```
+
+Ignore patterns use Go `path.Match` shell-style glob rules and match slash-normalized relative paths and base filenames.
+
 ## Mirror Rules
 
 Each sync:
 
 1. Walks `--source`.
-2. Skips ignored directories: `.bbrs`, `.git`, `target`, `node_modules`, `dist`, `build`, `.zed`, `.vscode`, `.idea`, `coverage`, `tmp`, `temp`, plus any `--ignore-dir` or `ignored_dirs` config values.
+2. Skips ignored paths matching default ignore patterns plus any `--ignore` or `ignore` config values.
 3. Uploads every desired local file to `--host` under `--destination`.
 4. Fetches remote metadata with `getAllFileMetadata`.
 5. Deletes stale remote files only when they are under `--destination` and match active patterns.

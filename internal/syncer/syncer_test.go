@@ -75,6 +75,15 @@ func TestUnsafeRemotePathsRejected(t *testing.T) {
 	}
 }
 
+func mustIgnored(t *testing.T, extra []string) IgnoredPatterns {
+	t.Helper()
+	ignored, err := NewIgnoredPatterns(extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ignored
+}
+
 func TestPathNormalizationConvertsBackslashes(t *testing.T) {
 	got, err := NormalizeRemoteFilePath(`scripts\batch\main.js`)
 	if err != nil {
@@ -116,7 +125,7 @@ func TestDestinationPathJoining(t *testing.T) {
 	}
 }
 
-func TestIgnoredDirsSkippedCaseInsensitively(t *testing.T) {
+func TestDefaultIgnorePatternsSkipDirectoriesCaseInsensitively(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "TARGET", "main.js"), "ignored")
 	writeFile(t, filepath.Join(root, "Node_Modules", "dep.js"), "ignored")
@@ -126,7 +135,7 @@ func TestIgnoredDirsSkippedCaseInsensitively(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs(nil))
+	desired, _, err := BuildDesired(root, "", patterns, mustIgnored(t, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,16 +146,17 @@ func TestIgnoredDirsSkippedCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestExtraIgnoredDirsWork(t *testing.T) {
+func TestExtraIgnorePatternsWork(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "vendor", "dep.js"), "ignored")
+	writeFile(t, filepath.Join(root, "src", "main.map"), "ignored")
 	writeFile(t, filepath.Join(root, "main.js"), "ok")
 
 	patterns, err := NewPatterns(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs([]string{"vendor"}))
+	desired, _, err := BuildDesired(root, "", patterns, mustIgnored(t, []string{"vendor,*.map"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +186,7 @@ func TestSymlinkedPathsAreSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired, _, err := BuildDesired(root, "", patterns, NewIgnoredDirs(nil))
+	desired, _, err := BuildDesired(root, "", patterns, mustIgnored(t, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +206,7 @@ func TestSyncPlanOrderingIsDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := BuildPlan(root, "scripts", patterns, NewIgnoredDirs(nil), nil)
+	plan, err := BuildPlan(root, "scripts", patterns, mustIgnored(t, nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +238,7 @@ func TestMirrorDeletesOnlyMatchingStaleFilesUnderDestination(t *testing.T) {
 		Destination: "scripts",
 		Host:        "home",
 		Patterns:    patterns,
-		Ignored:     NewIgnoredDirs(nil),
+		Ignored:     mustIgnored(t, nil),
 		State:       NewState(),
 	})
 	if err != nil {
@@ -260,7 +270,7 @@ func TestMirrorSkipsUnchangedUploads(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    state,
 	}
 
@@ -298,7 +308,7 @@ func TestMirrorReuploadsCachedFileWhenRemoteMissing(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    state,
 	}
 
@@ -337,7 +347,7 @@ func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    NewState(),
 	}
 	if _, err := Mirror(context.Background(), api, options); err != nil {
@@ -357,59 +367,6 @@ func TestMirrorUploadsAfterLocalModification(t *testing.T) {
 	}
 }
 
-func TestMirrorDryRunDoesNotUploadDeleteOrMutateCache(t *testing.T) {
-	root := t.TempDir()
-	mainPath := filepath.Join(root, "main.js")
-	writeFile(t, mainPath, "v1")
-	writeFile(t, filepath.Join(root, "new.js"), "v1")
-	writeFile(t, filepath.Join(root, "notes.txt"), "ignored")
-
-	info, err := os.Stat(mainPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := NewState()
-	state.RememberUpload("main.js", FileStampFromInfo(info))
-	state.RememberUpload("old.js", FileStamp{Size: 3, ModTime: 4})
-
-	patterns, err := NewPatterns(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	api := &fakeAPI{remoteMetadata: []FileMetadata{
-		{Filename: "main.js"},
-		{Filename: "old.js"},
-		{Filename: "/invalid.js"},
-	}}
-
-	result, err := Mirror(context.Background(), api, Options{
-		Source:   root,
-		Host:     "home",
-		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
-		State:    state,
-		DryRun:   true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Summary.Uploaded != 1 || result.Summary.Skipped != 1 || result.Summary.Deleted != 1 || result.Summary.Ignored != 1 {
-		t.Fatalf("summary = %+v", result.Summary)
-	}
-	if len(api.uploaded) != 0 {
-		t.Fatalf("uploaded = %v", api.uploaded)
-	}
-	if len(api.deleted) != 0 {
-		t.Fatalf("deleted = %v", api.deleted)
-	}
-	if _, ok := state.UploadCache["main.js"]; !ok {
-		t.Fatal("main.js cache entry missing")
-	}
-	if _, ok := state.UploadCache["old.js"]; !ok {
-		t.Fatal("old.js cache entry was mutated")
-	}
-}
-
 func TestMirrorClearsUploadCacheOnDelete(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "main.js"), "ok")
@@ -424,7 +381,7 @@ func TestMirrorClearsUploadCacheOnDelete(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    state,
 	}
 	if _, err := Mirror(context.Background(), api, options); err != nil {
@@ -455,7 +412,7 @@ func TestMirrorContinuesOnIndividualFileErrors(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    NewState(),
 	})
 	if err != nil {
@@ -482,7 +439,7 @@ func TestSyncChangesUploadsModifiedFile(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    NewState(),
 	}, ChangeSet{Modified: []string{"main.js"}})
 	if err != nil {
@@ -504,7 +461,7 @@ func TestSyncChangesDeletesRemovedFile(t *testing.T) {
 		Source:   root,
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  NewIgnoredDirs(nil),
+		Ignored:  mustIgnored(t, nil),
 		State:    NewState(),
 	}, ChangeSet{Deleted: []string{"old.js"}})
 	if err != nil {

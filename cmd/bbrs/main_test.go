@@ -104,11 +104,15 @@ func testOptions(t *testing.T) syncer.Options {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ignored, err := syncer.NewIgnoredPatterns(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return syncer.Options{
 		Source:   t.TempDir(),
 		Host:     "home",
 		Patterns: patterns,
-		Ignored:  syncer.NewIgnoredDirs(nil),
+		Ignored:  ignored,
 		State:    syncer.NewState(),
 	}
 }
@@ -137,27 +141,25 @@ func TestParseConfigDefaultValues(t *testing.T) {
 	if cfg.LogDir != "" {
 		t.Fatalf("logdir = %q", cfg.LogDir)
 	}
-	if cfg.DryRun {
-		t.Fatal("dry run enabled by default")
-	}
-	if cfg.Once {
-		t.Fatal("once enabled by default")
-	}
 	if cfg.Verbose {
 		t.Fatal("verbose enabled by default")
 	}
-	if cfg.AllowRemoteListen {
-		t.Fatal("allow remote listen enabled by default")
-	}
 }
 
-func TestRunVersionPrintsWithoutSource(t *testing.T) {
-	var output bytes.Buffer
-	if err := run([]string{"--version"}, os.Stdin, &output, &bytes.Buffer{}); err != nil {
-		t.Fatal(err)
+func TestRunVersionFlagsPrintWithoutSource(t *testing.T) {
+	var outputs []string
+	for _, flag := range []string{"-v", "--version"} {
+		var output bytes.Buffer
+		if err := run([]string{flag}, os.Stdin, &output, &bytes.Buffer{}); err != nil {
+			t.Fatalf("%s: %v", flag, err)
+		}
+		if !strings.HasSuffix(output.String(), "\n") {
+			t.Fatalf("%s version output = %q", flag, output.String())
+		}
+		outputs = append(outputs, output.String())
 	}
-	if !strings.HasSuffix(output.String(), "\n") {
-		t.Fatalf("version output = %q", output.String())
+	if outputs[0] != outputs[1] {
+		t.Fatalf("-v output = %q, --version output = %q", outputs[0], outputs[1])
 	}
 }
 
@@ -168,53 +170,14 @@ func TestParseConfigRequiresSource(t *testing.T) {
 	}
 }
 
-func TestParseConfigListenSafety(t *testing.T) {
+func TestParseConfigAllowsExplicitListenAddress(t *testing.T) {
 	source := t.TempDir()
-	tests := []struct {
-		name      string
-		args      []string
-		wantError string
-	}{
-		{
-			name: "default loopback",
-			args: []string{"-s", source},
-		},
-		{
-			name: "localhost loopback",
-			args: []string{"-s", source, "--listen", "localhost"},
-		},
-		{
-			name:      "wildcard rejected",
-			args:      []string{"-s", source, "--listen", "0.0.0.0"},
-			wantError: "use --allow-remote-listen",
-		},
-		{
-			name: "wildcard allowed",
-			args: []string{"-s", source, "--listen", "0.0.0.0", "--allow-remote-listen"},
-		},
-		{
-			name:      "ambiguous hostname rejected",
-			args:      []string{"-s", source, "--listen", "devbox"},
-			wantError: "use --allow-remote-listen",
-		},
+	cfg, err := parseConfig([]string{"-s", source, "--listen", "0.0.0.0"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := parseConfig(tc.args, &bytes.Buffer{})
-			if tc.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
-					t.Fatalf("err = %v, want %q", err, tc.wantError)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Contains(strings.Join(tc.args, " "), "--allow-remote-listen") && !cfg.AllowRemoteListen {
-				t.Fatal("allow remote listen not set")
-			}
-		})
+	if cfg.Listen != "0.0.0.0" {
+		t.Fatalf("listen = %q", cfg.Listen)
 	}
 }
 
@@ -224,7 +187,7 @@ func TestParseConfigLoadsFileDefaults(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"port":13010,"destination":"scripts","verbose":true}`
+	payload := `{"port":13010,"destination":"scripts","ignore":["dist","tmp,*.map"],"verbose":true}`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(payload), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +204,20 @@ func TestParseConfigLoadsFileDefaults(t *testing.T) {
 	}
 	if !cfg.Verbose {
 		t.Fatal("verbose not set from config")
+	}
+	if len(cfg.Ignore) != 2 || cfg.Ignore[0] != "dist" || cfg.Ignore[1] != "tmp,*.map" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+}
+
+func TestParseConfigAcceptsRepeatedAndCommaSeparatedIgnore(t *testing.T) {
+	source := t.TempDir()
+	cfg, err := parseConfig([]string{"-s", source, "--ignore", "dist,tmp", "--ignore", "*.map"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Ignore) != 2 || cfg.Ignore[0] != "dist,tmp" || cfg.Ignore[1] != "*.map" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
 	}
 }
 
@@ -287,22 +264,49 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"--pattern '*.txt'",
 		"--pattern '*.js,*.ts,*.ns'",
 		"--pattern '*.script' --pattern '*.txt'",
+		"Ignore examples:",
+		"--ignore dist",
+		"--ignore dist,tmp,*.map",
+		"--ignore vendor --ignore '*.map'",
 		"Logging:",
 		"Default: /var/log/bbrs/",
 		"Persistent cache:",
 		"Config file:",
-		"--yes",
-		"--once",
 		"--verbose",
 		"--log-dir              Directory for log files.",
-		"--dry-run",
-		"--allow-remote-listen",
-		"--version",
+		"-d, --destination          Destination directory inside Bitburner. Default: root.",
+		"-v, --version              Print version and exit.",
+		"-h, --help                 Show help.",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
 		}
 	}
+	for _, removed := range []string{
+		"--dry-run",
+		"--once",
+		"-y, --yes",
+		"--allow-remote-listen",
+		"--ignore-dir",
+		"Default: empty/root",
+	} {
+		if strings.Contains(text, removed) {
+			t.Fatalf("help contains removed text %q:\n%s", removed, text)
+		}
+	}
+	assertHelpOrder(t, text, []string{
+		"-s, --source",
+		"-d, --destination",
+		"-l, --listen",
+		"-p, --port",
+		"--host",
+		"--pattern",
+		"--ignore",
+		"--log-dir",
+		"--verbose",
+		"-v, --version",
+		"-h, --help",
+	})
 }
 
 func TestParseConfigRejectsNonDirectorySource(t *testing.T) {
@@ -314,40 +318,6 @@ func TestParseConfigRejectsNonDirectorySource(t *testing.T) {
 	_, err := parseConfig([]string{"--source", file}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "is not a directory") {
 		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestConfirmDestructiveSkipsPromptWithYes(t *testing.T) {
-	setupTestLogger(t)
-	var output bytes.Buffer
-	proceed, err := confirmDestructive(os.Stdin, &output, "home", "scripts", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !proceed {
-		t.Fatal("expected proceed")
-	}
-	if strings.Contains(output.String(), "Proceed?") {
-		t.Fatalf("unexpected prompt:\n%s", output.String())
-	}
-}
-
-func TestConfirmDestructiveRejectsNonInteractiveWithoutYes(t *testing.T) {
-	setupTestLogger(t)
-	original := stdinIsInteractive
-	stdinIsInteractive = func(*os.File) bool { return false }
-	t.Cleanup(func() { stdinIsInteractive = original })
-
-	var output bytes.Buffer
-	proceed, err := confirmDestructive(os.Stdin, &output, "home", "scripts", false)
-	if err == nil || !strings.Contains(err.Error(), "refusing destructive sync in non-interactive mode without --yes") {
-		t.Fatalf("err = %v", err)
-	}
-	if proceed {
-		t.Fatal("expected refusal")
-	}
-	if strings.Contains(output.String(), "Proceed?") {
-		t.Fatalf("unexpected prompt:\n%s", output.String())
 	}
 }
 
@@ -587,6 +557,21 @@ func TestRunOneSyncRespectsContextCancellation(t *testing.T) {
 
 	if app.runOneSync("cancelled", syncer.ChangeSet{}) {
 		t.Fatal("expected cancelled sync to fail")
+	}
+}
+
+func assertHelpOrder(t *testing.T, text string, wants []string) {
+	t.Helper()
+	last := -1
+	for _, want := range wants {
+		idx := strings.Index(text, want)
+		if idx == -1 {
+			t.Fatalf("help missing %q:\n%s", want, text)
+		}
+		if idx < last {
+			t.Fatalf("help option %q out of order:\n%s", want, text)
+		}
+		last = idx
 	}
 }
 

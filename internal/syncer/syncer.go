@@ -30,10 +30,9 @@ type Options struct {
 	Destination string
 	Host        string
 	Patterns    Patterns
-	Ignored     IgnoredDirs
+	Ignored     IgnoredPatterns
 	State       *State
 	CachePath   string
-	DryRun      bool
 }
 
 // DesiredFile is a local file that should exist remotely.
@@ -82,7 +81,7 @@ func RemoteNames(metadata []FileMetadata) []string {
 }
 
 // BuildPlan builds the full mirror upload and delete plan.
-func BuildPlan(source, destination string, patterns Patterns, ignored IgnoredDirs, remoteNames []string) (Plan, error) {
+func BuildPlan(source, destination string, patterns Patterns, ignored IgnoredPatterns, remoteNames []string) (Plan, error) {
 	desired, ignoredCount, err := BuildDesired(source, destination, patterns, ignored)
 	if err != nil {
 		return Plan{}, err
@@ -130,7 +129,7 @@ func BuildDeletes(destination string, patterns Patterns, desired []DesiredFile, 
 }
 
 // BuildDesired walks source and returns files that should exist remotely.
-func BuildDesired(source, destination string, patterns Patterns, ignored IgnoredDirs) ([]DesiredFile, int, error) {
+func BuildDesired(source, destination string, patterns Patterns, ignored IgnoredPatterns) ([]DesiredFile, int, error) {
 	files := make([]DesiredFile, 0)
 	ignoredCount := 0
 
@@ -270,10 +269,6 @@ func applyUploads(ctx context.Context, api RemoteAPI, options Options, desired [
 			result.Summary.Skipped++
 			continue
 		}
-		if options.DryRun {
-			result.Summary.Uploaded++
-			continue
-		}
 		content, err := os.ReadFile(file.SourcePath)
 		if err != nil {
 			result.Summary.Failed++
@@ -307,10 +302,6 @@ func applyDeletes(ctx context.Context, api RemoteAPI, options Options, deletes [
 			result.Errors = append(result.Errors, err)
 			break
 		}
-		if options.DryRun {
-			result.Summary.Deleted++
-			continue
-		}
 		if err := api.DeleteFile(ctx, options.Host, remote); err != nil {
 			result.Summary.Failed++
 			result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", remote, err))
@@ -330,7 +321,7 @@ func applyDeletes(ctx context.Context, api RemoteAPI, options Options, deletes [
 }
 
 func saveCache(options Options) []error {
-	if options.State == nil || options.CachePath == "" || options.DryRun {
+	if options.State == nil || options.CachePath == "" {
 		return nil
 	}
 	if err := options.State.Save(options.CachePath); err != nil {

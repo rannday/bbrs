@@ -18,6 +18,7 @@ func TestLoadJSONConfig(t *testing.T) {
   "destination": "scripts",
   "host": "home",
   "patterns": ["*.txt"],
+  "ignore": ["vendor", "tmp,*.map"],
   "verbose": true
 }`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(payload), 0600); err != nil {
@@ -40,6 +41,9 @@ func TestLoadJSONConfig(t *testing.T) {
 	if file.Verbose == nil || !*file.Verbose {
 		t.Fatalf("verbose = %#v", file.Verbose)
 	}
+	if len(file.Ignore) != 2 || file.Ignore[0] != "vendor" || file.Ignore[1] != "tmp,*.map" {
+		t.Fatalf("ignore = %#v", file.Ignore)
+	}
 }
 
 func TestLoadTOMLConfig(t *testing.T) {
@@ -52,7 +56,7 @@ func TestLoadTOMLConfig(t *testing.T) {
 listen = "127.0.0.1"
 port = 13001
 destination = "batch"
-once = true
+ignore = ["dist", "*.map"]
 `
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
 		t.Fatal(err)
@@ -65,7 +69,7 @@ once = true
 	if file.Port == nil || *file.Port != 13001 {
 		t.Fatalf("port = %#v", file.Port)
 	}
-	if file.Once == nil || !*file.Once {
-		t.Fatalf("once = %#v", file.Once)
+	if len(file.Ignore) != 2 || file.Ignore[0] != "dist" || file.Ignore[1] != "*.map" {
+		t.Fatalf("ignore = %#v", file.Ignore)
 	}
 }

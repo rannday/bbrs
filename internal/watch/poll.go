@@ -13,7 +13,7 @@ type FileState struct {
 type Snapshot map[string]FileState
 
 // SnapshotSource captures the current source tree state.
-func SnapshotSource(source string, patterns syncer.Patterns, ignored syncer.IgnoredDirs) (Snapshot, error) {
+func SnapshotSource(source string, patterns syncer.Patterns, ignored syncer.IgnoredPatterns) (Snapshot, error) {
 	snapshot := make(Snapshot)
 	err := syncer.WalkSource(source, patterns, ignored, func(entry syncer.SourceEntry) error {
 		snapshot[entry.Relative] = FileState{

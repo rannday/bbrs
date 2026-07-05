@@ -53,7 +53,7 @@ func TestSnapshotSourceUsesCleanedRelativePaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := SnapshotSource(root, patterns, syncer.NewIgnoredDirs(nil))
+	snapshot, err := SnapshotSource(root, patterns, mustIgnored(t, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestPollSeedsBaselineWithoutTriggeringChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignored := syncer.NewIgnoredDirs(nil)
+	ignored := mustIgnored(t, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -102,7 +102,7 @@ func TestPollDetectsMatchedFileChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignored := syncer.NewIgnoredDirs(nil)
+	ignored := mustIgnored(t, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -131,6 +131,30 @@ func TestPollDetectsMatchedFileChanges(t *testing.T) {
 	if got := changes.Load(); got != 1 {
 		t.Fatalf("changes = %d, want 1", got)
 	}
+}
+
+func TestIgnoredPathChecksParentDirectories(t *testing.T) {
+	ignored := mustIgnored(t, []string{"vendor/generated"})
+	for _, relative := range []string{
+		"dist/main.js",
+		"vendor/generated/main.js",
+	} {
+		if !ignoredPath(relative, ignored) {
+			t.Fatalf("%s was not ignored", relative)
+		}
+	}
+	if ignoredPath("src/main.js", ignored) {
+		t.Fatal("src/main.js was ignored")
+	}
+}
+
+func mustIgnored(t *testing.T, extra []string) syncer.IgnoredPatterns {
+	t.Helper()
+	ignored, err := syncer.NewIgnoredPatterns(extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ignored
 }
 
 func writeFile(t *testing.T, path, content string) {

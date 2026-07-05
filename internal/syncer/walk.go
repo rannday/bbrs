@@ -12,8 +12,8 @@ type SourceEntry struct {
 	Info       fs.FileInfo
 }
 
-// WalkSource visits regular files under source, skipping ignored directories and symlinks.
-func WalkSource(source string, patterns Patterns, ignored IgnoredDirs, visit func(SourceEntry) error) error {
+// WalkSource visits regular files under source, skipping ignored paths and symlinks.
+func WalkSource(source string, patterns Patterns, ignored IgnoredPatterns, visit func(SourceEntry) error) error {
 	return filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -25,8 +25,18 @@ func WalkSource(source string, patterns Patterns, ignored IgnoredDirs, visit fun
 			return nil
 		}
 		if entry.IsDir() {
-			if current != source && ignored.IsIgnored(entry.Name()) {
-				return filepath.SkipDir
+			if current != source {
+				relativePath, err := filepath.Rel(source, current)
+				if err != nil {
+					return err
+				}
+				relative, err := cleanRelativeSlashPath(relativePath)
+				if err != nil {
+					return err
+				}
+				if ignored.IsIgnored(relative) {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
@@ -45,6 +55,9 @@ func WalkSource(source string, patterns Patterns, ignored IgnoredDirs, visit fun
 		relative, err := cleanRelativeSlashPath(relativePath)
 		if err != nil {
 			return err
+		}
+		if ignored.IsIgnored(relative) {
+			return nil
 		}
 		return visit(SourceEntry{
 			SourcePath: current,

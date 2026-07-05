@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -30,20 +29,16 @@ import (
 )
 
 type cliConfig struct {
-	Source            string
-	Listen            string
-	Port              int
-	Destination       string
-	Host              string
-	Patterns          []string
-	IgnoredDirs       []string
-	Yes               bool
-	DryRun            bool
-	Once              bool
-	Verbose           bool
-	AllowRemoteListen bool
-	Version           bool
-	LogDir            string
+	Source      string
+	Listen      string
+	Port        int
+	Destination string
+	Host        string
+	Patterns    []string
+	Ignore      []string
+	Verbose     bool
+	Version     bool
+	LogDir      string
 }
 
 type patternFlags []string
@@ -57,17 +52,6 @@ func (flags *patternFlags) Set(value string) error {
 	return nil
 }
 
-type ignoredDirFlags []string
-
-func (flags *ignoredDirFlags) String() string {
-	return strings.Join(*flags, ",")
-}
-
-func (flags *ignoredDirFlags) Set(value string) error {
-	*flags = append(*flags, value)
-	return nil
-}
-
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		logx.ErrorErr("bbrs failed", err)
@@ -75,7 +59,7 @@ func main() {
 	}
 }
 
-func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
+func run(args []string, _ *os.File, stdout, stderr io.Writer) error {
 	cfg, err := parseConfig(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -100,18 +84,15 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		return fmt.Errorf("configure logging: %w", err)
 	}
 	logx.Info("logging enabled", "path", logPath, "verbose", cfg.Verbose)
-	if cfg.AllowRemoteListen && !isLoopbackListenAddress(cfg.Listen) {
-		logx.Warn(
-			"non-loopback listen address enabled; remote browser origins may connect and trigger destructive sync operations",
-			"listen", cfg.Listen,
-		)
-	}
 
 	patterns, err := syncer.NewPatterns(cfg.Patterns)
 	if err != nil {
 		return err
 	}
-	ignored := syncer.NewIgnoredDirs(cfg.IgnoredDirs)
+	ignored, err := syncer.NewIgnoredPatterns(cfg.Ignore)
+	if err != nil {
+		return err
+	}
 
 	cachePath := syncer.CachePath(cfg.Source)
 	state, err := syncer.LoadState(cachePath)
@@ -119,16 +100,6 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		return err
 	}
 	logx.Info("loaded upload cache", "path", cachePath, "entries", len(state.UploadCache))
-
-	if !cfg.DryRun {
-		proceed, err := confirmDestructive(stdin, stdout, cfg.Host, cfg.Destination, cfg.Yes)
-		if err != nil {
-			return err
-		}
-		if !proceed {
-			return nil
-		}
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -141,7 +112,6 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		Ignored:     ignored,
 		State:       state,
 		CachePath:   cachePath,
-		DryRun:      cfg.DryRun,
 	}
 
 	app := newApp(ctx, options)
@@ -170,16 +140,6 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) error {
 		logx.Info("listening for Bitburner Remote API websocket", "address", "ws://"+address)
 		serverErr <- server.ListenAndServe()
 	}()
-
-	if cfg.Once {
-		if err := app.waitForSuccessfulSync(ctx, 2*time.Minute); err != nil {
-			return err
-		}
-		cancel()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		return server.Shutdown(shutdownCtx)
-	}
 
 	select {
 	case err := <-serverErr:
@@ -215,15 +175,11 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 
 	var help bool
 	var patterns patternFlags
-	var ignoredDirs ignoredDirFlags
+	var ignored patternFlags
 	fs.BoolVar(&help, "h", false, "show help")
 	fs.BoolVar(&help, "help", false, "show help")
-	fs.BoolVar(&cfg.Yes, "y", false, "skip destructive-operation confirmation")
-	fs.BoolVar(&cfg.Yes, "yes", false, "skip destructive-operation confirmation")
-	fs.BoolVar(&cfg.DryRun, "dry-run", false, "build sync plan without uploading, deleting, or updating the cache")
-	fs.BoolVar(&cfg.Once, "once", false, "sync once after Bitburner connects, then exit")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "enable debug logging")
-	fs.BoolVar(&cfg.AllowRemoteListen, "allow-remote-listen", false, "allow listening on non-loopback addresses")
+	fs.BoolVar(&cfg.Version, "v", false, "print version and exit")
 	fs.BoolVar(&cfg.Version, "version", false, "print version and exit")
 	fs.StringVar(&cfg.Source, "s", "", "local source directory to sync")
 	fs.StringVar(&cfg.Source, "source", "", "local source directory to sync")
@@ -235,7 +191,7 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	fs.StringVar(&cfg.Destination, "destination", "", "destination directory inside Bitburner")
 	fs.StringVar(&cfg.Host, "host", cfg.Host, "destination Bitburner host")
 	fs.Var(&patterns, "pattern", "additional filename pattern to include")
-	fs.Var(&ignoredDirs, "ignore-dir", "additional directory name to ignore during sync")
+	fs.Var(&ignored, "ignore", "additional filename or directory pattern to ignore during sync")
 	fs.StringVar(&cfg.LogDir, "log-dir", "", "directory for log files")
 
 	if err := fs.Parse(args); err != nil {
@@ -248,6 +204,8 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	if cfg.Version {
 		return cfg, nil
 	}
+	cfg.Patterns = append([]string{}, patterns...)
+	cfg.Ignore = append([]string{}, ignored...)
 	if cfg.Source == "" {
 		return cliConfig{}, fmt.Errorf("--source is required")
 	}
@@ -270,9 +228,6 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	}
 	applyFileConfig(&cfg, fileCfg)
 
-	if !isLoopbackListenAddress(cfg.Listen) && !cfg.AllowRemoteListen {
-		return cliConfig{}, fmt.Errorf("listen address %q is not loopback; use --allow-remote-listen to allow remote browser origins", cfg.Listen)
-	}
 	if cfg.Destination != "" {
 		normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
 		if err != nil {
@@ -280,8 +235,6 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 		}
 		cfg.Destination = normalized
 	}
-	cfg.Patterns = append([]string{}, patterns...)
-	cfg.IgnoredDirs = append([]string{}, ignoredDirs...)
 	return cfg, nil
 }
 
@@ -304,23 +257,11 @@ func applyFileConfig(cfg *cliConfig, file config.File) {
 	if file.LogDir != "" && cfg.LogDir == "" {
 		cfg.LogDir = file.LogDir
 	}
-	if file.AllowRemoteListen != nil && !cfg.AllowRemoteListen {
-		cfg.AllowRemoteListen = *file.AllowRemoteListen
-	}
-	if file.DryRun != nil && !cfg.DryRun {
-		cfg.DryRun = *file.DryRun
-	}
 	if file.Verbose != nil && !cfg.Verbose {
 		cfg.Verbose = *file.Verbose
 	}
-	if file.Once != nil && !cfg.Once {
-		cfg.Once = *file.Once
-	}
-	if file.Yes != nil && !cfg.Yes {
-		cfg.Yes = *file.Yes
-	}
-	if len(file.IgnoredDirs) > 0 && len(cfg.IgnoredDirs) == 0 {
-		cfg.IgnoredDirs = append([]string{}, file.IgnoredDirs...)
+	if len(file.Ignore) > 0 && len(cfg.Ignore) == 0 {
+		cfg.Ignore = append([]string{}, file.Ignore...)
 	}
 }
 
@@ -329,21 +270,17 @@ func helpText() string {
   bbrs -s ./source-dir [options]
 
 Options:
-  -h, --help                 Show help.
-      --version              Print version and exit.
   -s, --source               Local source directory to sync. Required.
+  -d, --destination          Destination directory inside Bitburner. Default: root.
   -l, --listen               Listen address. Default: 127.0.0.1.
   -p, --port                 Listen port. Default: 12525.
-  -d, --destination          Destination directory inside Bitburner. Default: empty/root.
       --host                 Destination Bitburner host. Default: home.
       --pattern              Additional filename patterns to include.
-      --ignore-dir           Additional directory name to ignore during sync.
+      --ignore               Additional filename or directory patterns to ignore during sync.
       --log-dir              Directory for log files.
-      --dry-run              Build the sync plan without uploading, deleting, or updating cache.
-      --once                 Sync once after Bitburner connects, then exit.
       --verbose              Enable debug logging.
-      --allow-remote-listen  Allow listening on non-loopback addresses.
-  -y, --yes                  Skip destructive-operation confirmation.
+  -v, --version              Print version and exit.
+  -h, --help                 Show help.
 
 Config file:
   Optional settings in <source>/.bbrs/config.toml or <source>/.bbrs/config.json.
@@ -357,62 +294,14 @@ Pattern examples:
   --pattern '*.js,*.ts,*.ns'
   --pattern '*.script' --pattern '*.txt'
 
+Ignore examples:
+  --ignore dist
+  --ignore dist,tmp,*.map
+  --ignore vendor --ignore '*.map'
+
 Logging:
   Default: /var/log/bbrs/ on Unix when present, otherwise <source>/.bbrs/
 `
-}
-
-var stdinIsInteractive = isInteractive
-
-func confirmDestructive(stdin *os.File, stdout io.Writer, host, destination string, skip bool) (bool, error) {
-	logx.Warn("bbrs mirrors your local source directory into Bitburner")
-	logx.Warn(
-		"remote files may be overwritten or deleted; stale matching files under the destination are removed",
-		"host", host,
-		"destination", syncer.DisplayDestination(destination),
-	)
-
-	if skip {
-		return true, nil
-	}
-	if !stdinIsInteractive(stdin) {
-		return false, fmt.Errorf("refusing destructive sync in non-interactive mode without --yes")
-	}
-
-	fmt.Fprint(stdout, "Proceed? [Y/n]: ")
-	reader := bufio.NewReader(stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	switch answer {
-	case "", "y", "yes":
-		return true, nil
-	case "n", "no":
-		return false, nil
-	default:
-		return false, fmt.Errorf("expected y/yes or n/no")
-	}
-}
-
-func isInteractive(file *os.File) bool {
-	if file == nil {
-		return false
-	}
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
-}
-
-func isLoopbackListenAddress(address string) bool {
-	if strings.EqualFold(address, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(address)
-	return ip != nil && ip.IsLoopback()
 }
 
 type syncJob struct {
@@ -432,10 +321,6 @@ type app struct {
 	running  bool
 	pending  *syncJob
 
-	statusMu   sync.Mutex
-	everSyncOK bool
-	syncOKCh   chan struct{}
-
 	everConnected              bool
 	waitingForConnectionLogged bool
 	disconnectedPendingLogged  bool
@@ -454,10 +339,9 @@ type syncFunc func(context.Context, syncer.RemoteAPI, syncer.Options, syncer.Cha
 
 func newApp(ctx context.Context, options syncer.Options) *app {
 	return &app{
-		ctx:      ctx,
-		options:  options,
-		syncFn:   defaultSyncFn,
-		syncOKCh: make(chan struct{}, 1),
+		ctx:     ctx,
+		options: options,
+		syncFn:  defaultSyncFn,
 	}
 }
 
@@ -646,32 +530,15 @@ func (app *app) runOneSync(reason string, changes syncer.ChangeSet) bool {
 	app.waitingForConnectionLogged = false
 	app.workerMu.Unlock()
 
-	message := "sync complete"
-	if app.options.DryRun {
-		message = "dry run complete"
-	}
 	logx.Info(
-		message,
+		"sync complete",
 		"reason", reason,
-		"dry_run", app.options.DryRun,
 		"uploaded", result.Summary.Uploaded,
 		"skipped", result.Summary.Skipped,
 		"deleted", result.Summary.Deleted,
 		"ignored", result.Summary.Ignored,
 		"failed", result.Summary.Failed,
 	)
-
-	if result.Summary.Failed == 0 {
-		app.statusMu.Lock()
-		if !app.everSyncOK {
-			app.everSyncOK = true
-			select {
-			case app.syncOKCh <- struct{}{}:
-			default:
-			}
-		}
-		app.statusMu.Unlock()
-	}
 	return result.Summary.Failed == 0
 }
 
@@ -695,20 +562,6 @@ func (app *app) markSyncPendingDisconnected() {
 	}
 	app.disconnectedPendingLogged = true
 	logx.Info("Bitburner disconnected; sync pending")
-}
-
-func (app *app) waitForSuccessfulSync(ctx context.Context, timeout time.Duration) error {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-app.syncOKCh:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("timed out after %s waiting for successful sync", timeout)
-	}
 }
 
 // triggerSync queues a full mirror sync. Used by tests.
