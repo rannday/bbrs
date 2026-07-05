@@ -32,22 +32,6 @@ On first connection, `bbrs` performs a full sync. It keeps running and polls the
 
 ## Options
 
-```text
--h, --help
---version          Print version and exit.
--s, --source       Local source directory to sync. Required.
--l, --listen       Listen address. Default: 127.0.0.1.
--p, --port         Listen port. Default: 12525.
--d, --destination  Destination directory inside Bitburner. Default: empty/root.
---host             Destination Bitburner host. Default: home.
---pattern          Additional filename patterns to include.
---logdir           Directory for log files.
---dry-run          Build the sync plan without uploading, deleting, or updating cache.
---allow-remote-listen
-                  Allow listening on non-loopback addresses.
--y, --yes          Skip destructive-operation confirmation.
-```
-
 On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, and `ignored` counts. Unchanged local files are skipped using a local upload cache only when the remote metadata still contains the file, so a remotely deleted file is uploaded again on the next sync.
 
 `--dry-run` still requires a Bitburner Remote API connection because it reads remote metadata, but it does not call `pushFile`, does not call `deleteFile`, and does not update the local upload cache. Counts mean would-upload, would-skip, would-delete, and ignored.
