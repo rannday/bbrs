@@ -6,22 +6,22 @@ import (
 	"testing"
 )
 
-func TestLoadJSONConfig(t *testing.T) {
+func TestLoadTOMLConfig(t *testing.T) {
 	source := t.TempDir()
 	dir := filepath.Join(source, ".bbrs")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{
-  "listen": "127.0.0.1",
-  "port": 13000,
-  "destination": "scripts",
-  "host": "home",
-  "patterns": ["*.txt"],
-  "ignore": ["vendor", "tmp,*.map"],
-  "verbose": true
-}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(payload), 0600); err != nil {
+	payload := `
+listen = "127.0.0.1"
+port = 13000
+destination = "scripts"
+target = "n00dles"
+include = ["*.txt"]
+ignore = ["vendor", "tmp,*.map"]
+verbose = true
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -38,27 +38,27 @@ func TestLoadJSONConfig(t *testing.T) {
 	if file.Destination != "scripts" {
 		t.Fatalf("destination = %q", file.Destination)
 	}
+	if file.Target != "n00dles" {
+		t.Fatalf("target = %q", file.Target)
+	}
 	if file.Verbose == nil || !*file.Verbose {
 		t.Fatalf("verbose = %#v", file.Verbose)
+	}
+	if len(file.Include) != 1 || file.Include[0] != "*.txt" {
+		t.Fatalf("include = %#v", file.Include)
 	}
 	if len(file.Ignore) != 2 || file.Ignore[0] != "vendor" || file.Ignore[1] != "tmp,*.map" {
 		t.Fatalf("ignore = %#v", file.Ignore)
 	}
 }
 
-func TestLoadTOMLConfig(t *testing.T) {
+func TestLoadIgnoresJSONConfig(t *testing.T) {
 	source := t.TempDir()
 	dir := filepath.Join(source, ".bbrs")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	payload := `
-listen = "127.0.0.1"
-port = 13001
-destination = "batch"
-ignore = ["dist", "*.map"]
-`
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"port":13001}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,10 +66,7 @@ ignore = ["dist", "*.map"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if file.Port == nil || *file.Port != 13001 {
+	if file.Port != nil {
 		t.Fatalf("port = %#v", file.Port)
-	}
-	if len(file.Ignore) != 2 || file.Ignore[0] != "dist" || file.Ignore[1] != "*.map" {
-		t.Fatalf("ignore = %#v", file.Ignore)
 	}
 }

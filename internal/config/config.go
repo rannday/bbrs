@@ -1,43 +1,37 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 )
 
-// File holds optional settings loaded from <source>/.bbrs/config.toml or config.json.
+// File holds optional settings loaded from <source>/.bbrs/config.toml.
 // CLI flags override file values when both are set.
 type File struct {
-	Listen      string   `json:"listen" toml:"listen"`
-	Port        *int     `json:"port" toml:"port"`
-	Destination string   `json:"destination" toml:"destination"`
-	Host        string   `json:"host" toml:"host"`
-	Patterns    []string `json:"patterns" toml:"patterns"`
-	Ignore      []string `json:"ignore" toml:"ignore"`
-	LogDir      string   `json:"log_dir" toml:"log_dir"`
-	Verbose     *bool    `json:"verbose" toml:"verbose"`
+	Listen      string   `toml:"listen"`
+	Port        *int     `toml:"port"`
+	Destination string   `toml:"destination"`
+	Target      string   `toml:"target"`
+	Include     []string `toml:"include"`
+	Ignore      []string `toml:"ignore"`
+	LogDir      string   `toml:"log_dir"`
+	Verbose     *bool    `toml:"verbose"`
 }
 
-// Load reads config from <source>/.bbrs/config.toml or config.json when present.
+// Load reads config from <source>/.bbrs/config.toml when present.
 func Load(source string) (File, error) {
-	dir := filepath.Join(source, ".bbrs")
-	for _, name := range []string{"config.toml", "config.json"} {
-		path := filepath.Join(dir, name)
-		file, err := loadFile(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return File{}, err
+	path := filepath.Join(source, ".bbrs", "config.toml")
+	file, err := loadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return File{}, nil
 		}
-		return file, nil
+		return File{}, err
 	}
-	return File{}, nil
+	return file, nil
 }
 
 func loadFile(path string) (File, error) {
@@ -46,17 +40,8 @@ func loadFile(path string) (File, error) {
 		return File{}, err
 	}
 	var file File
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".toml":
-		if _, err := toml.Decode(string(data), &file); err != nil {
-			return File{}, fmt.Errorf("decode %q: %w", path, err)
-		}
-	case ".json":
-		if err := json.Unmarshal(data, &file); err != nil {
-			return File{}, fmt.Errorf("decode %q: %w", path, err)
-		}
-	default:
-		return File{}, fmt.Errorf("unsupported config extension %q", path)
+	if _, err := toml.Decode(string(data), &file); err != nil {
+		return File{}, fmt.Errorf("decode %q: %w", path, err)
 	}
 	return file, nil
 }

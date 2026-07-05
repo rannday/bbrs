@@ -33,21 +33,21 @@ type cliConfig struct {
 	Listen      string
 	Port        int
 	Destination string
-	Host        string
-	Patterns    []string
+	Target      string
+	Include     []string
 	Ignore      []string
 	Verbose     bool
 	Version     bool
 	LogDir      string
 }
 
-type patternFlags []string
+type listFlags []string
 
-func (flags *patternFlags) String() string {
+func (flags *listFlags) String() string {
 	return strings.Join(*flags, ",")
 }
 
-func (flags *patternFlags) Set(value string) error {
+func (flags *listFlags) Set(value string) error {
 	*flags = append(*flags, value)
 	return nil
 }
@@ -85,7 +85,7 @@ func run(args []string, _ *os.File, stdout, stderr io.Writer) error {
 	}
 	logx.Info("logging enabled", "path", logPath, "verbose", cfg.Verbose)
 
-	patterns, err := syncer.NewPatterns(cfg.Patterns)
+	patterns, err := syncer.NewPatterns(cfg.Include)
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ func run(args []string, _ *os.File, stdout, stderr io.Writer) error {
 	options := syncer.Options{
 		Source:      cfg.Source,
 		Destination: cfg.Destination,
-		Host:        cfg.Host,
+		Host:        cfg.Target,
 		Patterns:    patterns,
 		Ignored:     ignored,
 		State:       state,
@@ -165,7 +165,8 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	var cfg cliConfig
 	cfg.Listen = "127.0.0.1"
 	cfg.Port = 12525
-	cfg.Host = "home"
+	cfg.Destination = "bbrs"
+	cfg.Target = "home"
 
 	fs := flag.NewFlagSet("bbrs", flag.ContinueOnError)
 	fs.SetOutput(output)
@@ -174,8 +175,8 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	}
 
 	var help bool
-	var patterns patternFlags
-	var ignored patternFlags
+	var include listFlags
+	var ignored listFlags
 	fs.BoolVar(&help, "h", false, "show help")
 	fs.BoolVar(&help, "help", false, "show help")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "enable debug logging")
@@ -187,10 +188,11 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "listen address")
 	fs.IntVar(&cfg.Port, "p", cfg.Port, "listen port")
 	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
-	fs.StringVar(&cfg.Destination, "d", "", "destination directory inside Bitburner")
-	fs.StringVar(&cfg.Destination, "destination", "", "destination directory inside Bitburner")
-	fs.StringVar(&cfg.Host, "host", cfg.Host, "destination Bitburner host")
-	fs.Var(&patterns, "pattern", "additional filename pattern to include")
+	fs.StringVar(&cfg.Destination, "d", cfg.Destination, "destination directory inside Bitburner")
+	fs.StringVar(&cfg.Destination, "destination", cfg.Destination, "destination directory inside Bitburner")
+	fs.StringVar(&cfg.Target, "t", cfg.Target, "target Bitburner host")
+	fs.StringVar(&cfg.Target, "target", cfg.Target, "target Bitburner host")
+	fs.Var(&include, "include", "additional filename pattern to include")
 	fs.Var(&ignored, "ignore", "additional filename or directory pattern to ignore during sync")
 	fs.StringVar(&cfg.LogDir, "log-dir", "", "directory for log files")
 
@@ -204,7 +206,7 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	if cfg.Version {
 		return cfg, nil
 	}
-	cfg.Patterns = append([]string{}, patterns...)
+	cfg.Include = append([]string{}, include...)
 	cfg.Ignore = append([]string{}, ignored...)
 	if cfg.Source == "" {
 		return cliConfig{}, fmt.Errorf("--source is required")
@@ -228,13 +230,11 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	}
 	applyFileConfig(&cfg, fileCfg)
 
-	if cfg.Destination != "" {
-		normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
-		if err != nil {
-			return cliConfig{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
-		}
-		cfg.Destination = normalized
+	normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
+	if err != nil {
+		return cliConfig{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
 	}
+	cfg.Destination = normalized
 	return cfg, nil
 }
 
@@ -248,11 +248,11 @@ func applyFileConfig(cfg *cliConfig, file config.File) {
 	if file.Destination != "" {
 		cfg.Destination = file.Destination
 	}
-	if file.Host != "" {
-		cfg.Host = file.Host
+	if file.Target != "" {
+		cfg.Target = file.Target
 	}
-	if len(file.Patterns) > 0 && len(cfg.Patterns) == 0 {
-		cfg.Patterns = append([]string{}, file.Patterns...)
+	if len(file.Include) > 0 && len(cfg.Include) == 0 {
+		cfg.Include = append([]string{}, file.Include...)
 	}
 	if file.LogDir != "" && cfg.LogDir == "" {
 		cfg.LogDir = file.LogDir
@@ -270,29 +270,29 @@ func helpText() string {
   bbrs -s ./source-dir [options]
 
 Options:
-  -s, --source               Local source directory to sync. Required.
-  -d, --destination          Destination directory inside Bitburner. Default: root.
-  -l, --listen               Listen address. Default: 127.0.0.1.
-  -p, --port                 Listen port. Default: 12525.
-      --host                 Destination Bitburner host. Default: home.
-      --pattern              Additional filename patterns to include.
-      --ignore               Additional filename or directory patterns to ignore during sync.
+  -s, --source               Local source directory to sync. Required
+  -d, --destination          Destination directory inside Bitburner. Default: /bbrs/
+  -l, --listen               Listen address. Default: 127.0.0.1
+  -p, --port                 Listen port. Default: 12525
+  -t, --target               Target Bitburner host. Default: home
+      --include              Additional filename patterns to include.
+      --ignore               Additional filename or directory patterns to ignore.
       --log-dir              Directory for log files.
       --verbose              Enable debug logging.
   -v, --version              Print version and exit.
   -h, --help                 Show help.
 
 Config file:
-  Optional settings in <source>/.bbrs/config.toml or <source>/.bbrs/config.json.
+  Optional settings in <source>/.bbrs/config.toml.
   CLI flags override config file values.
 
 Persistent cache:
   Upload cache stored in <source>/.bbrs/cache.json across restarts.
 
-Pattern examples:
-  --pattern '*.txt'
-  --pattern '*.js,*.ts,*.ns'
-  --pattern '*.script' --pattern '*.txt'
+Include examples:
+  --include '*.txt'
+  --include '*.js,*.ts,*.ns'
+  --include '*.script' --include '*.txt'
 
 Ignore examples:
   --ignore dist
@@ -300,7 +300,7 @@ Ignore examples:
   --ignore vendor --ignore '*.map'
 
 Logging:
-  Default: /var/log/bbrs/ on Unix when present, otherwise <source>/.bbrs/
+  Default: /var/log/bbrs/ on *nix when present, otherwise <source>/.bbrs/
 `
 }
 

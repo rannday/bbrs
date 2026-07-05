@@ -132,10 +132,10 @@ func TestParseConfigDefaultValues(t *testing.T) {
 	if cfg.Port != 12525 {
 		t.Fatalf("port = %d", cfg.Port)
 	}
-	if cfg.Host != "home" {
-		t.Fatalf("host = %q", cfg.Host)
+	if cfg.Target != "home" {
+		t.Fatalf("target = %q", cfg.Target)
 	}
-	if cfg.Destination != "" {
+	if cfg.Destination != "bbrs" {
 		t.Fatalf("destination = %q", cfg.Destination)
 	}
 	if cfg.LogDir != "" {
@@ -187,8 +187,15 @@ func TestParseConfigLoadsFileDefaults(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"port":13010,"destination":"scripts","ignore":["dist","tmp,*.map"],"verbose":true}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(payload), 0600); err != nil {
+	payload := `
+port = 13010
+destination = "scripts"
+target = "n00dles"
+include = ["*.txt", "*.ns"]
+ignore = ["dist", "tmp,*.map"]
+verbose = true
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,11 +209,44 @@ func TestParseConfigLoadsFileDefaults(t *testing.T) {
 	if cfg.Destination != "scripts" {
 		t.Fatalf("destination = %q", cfg.Destination)
 	}
+	if cfg.Target != "n00dles" {
+		t.Fatalf("target = %q", cfg.Target)
+	}
 	if !cfg.Verbose {
 		t.Fatal("verbose not set from config")
 	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "*.txt" || cfg.Include[1] != "*.ns" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
 	if len(cfg.Ignore) != 2 || cfg.Ignore[0] != "dist" || cfg.Ignore[1] != "tmp,*.map" {
 		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+}
+
+func TestParseConfigAcceptsTargetFlags(t *testing.T) {
+	source := t.TempDir()
+	for _, args := range [][]string{
+		{"-s", source, "-t", "n00dles"},
+		{"-s", source, "--target", "n00dles"},
+	} {
+		cfg, err := parseConfig(args, &bytes.Buffer{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Target != "n00dles" {
+			t.Fatalf("%v target = %q", args, cfg.Target)
+		}
+	}
+}
+
+func TestParseConfigAcceptsRepeatedAndCommaSeparatedInclude(t *testing.T) {
+	source := t.TempDir()
+	cfg, err := parseConfig([]string{"-s", source, "--include", "*.txt,*.ns", "--include", "*.script"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "*.txt,*.ns" || cfg.Include[1] != "*.script" {
+		t.Fatalf("include = %#v", cfg.Include)
 	}
 }
 
@@ -252,7 +292,7 @@ func TestParseConfigRejectsUnsafeDestination(t *testing.T) {
 	}
 }
 
-func TestHelpIncludesPatternExamples(t *testing.T) {
+func TestHelpIncludesIncludeExamples(t *testing.T) {
 	var output bytes.Buffer
 	_, err := parseConfig([]string{"--help"}, &output)
 	if err != flag.ErrHelp {
@@ -260,10 +300,10 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 	}
 	text := output.String()
 	for _, want := range []string{
-		"Pattern examples:",
-		"--pattern '*.txt'",
-		"--pattern '*.js,*.ts,*.ns'",
-		"--pattern '*.script' --pattern '*.txt'",
+		"Include examples:",
+		"--include '*.txt'",
+		"--include '*.js,*.ts,*.ns'",
+		"--include '*.script' --include '*.txt'",
 		"Ignore examples:",
 		"--ignore dist",
 		"--ignore dist,tmp,*.map",
@@ -274,7 +314,8 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"Config file:",
 		"--verbose",
 		"--log-dir              Directory for log files.",
-		"-d, --destination          Destination directory inside Bitburner. Default: root.",
+		"-d, --destination          Destination directory inside Bitburner. Default: /bbrs/",
+		"-t, --target               Target Bitburner host. Default: home",
 		"-v, --version              Print version and exit.",
 		"-h, --help                 Show help.",
 	} {
@@ -288,6 +329,10 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"-y, --yes",
 		"--allow-remote-listen",
 		"--ignore-dir",
+		"--pattern",
+		"--host",
+		"config.json",
+		"Default: root",
 		"Default: empty/root",
 	} {
 		if strings.Contains(text, removed) {
@@ -299,8 +344,8 @@ func TestHelpIncludesPatternExamples(t *testing.T) {
 		"-d, --destination",
 		"-l, --listen",
 		"-p, --port",
-		"--host",
-		"--pattern",
+		"-t, --target",
+		"--include",
 		"--ignore",
 		"--log-dir",
 		"--verbose",

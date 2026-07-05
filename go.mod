@@ -10,4 +10,9 @@ require (
 	github.com/rannday/go-log v0.2.0
 )
 
-require golang.org/x/sys v0.13.0 // indirect
+require (
+	github.com/rannday/go-build-bin v0.1.5 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+)
+
+tool github.com/rannday/go-build-bin

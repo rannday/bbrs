@@ -27,7 +27,7 @@ make install
 ```sh
 ./bbrs -s ./src
 ./bbrs -s ./src -d scripts
-./bbrs -s ./src --host home --pattern '*.txt'
+./bbrs -s ./src --target home --include '*.txt'
 ./bbrs -s ./src --ignore dist --ignore tmp
 ./bbrs -s ./src -l 127.0.0.1 -p 12525
 ./bbrs -s ./src --verbose
@@ -50,21 +50,7 @@ On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, `ignored`, and `failed` c
 
 ## Config File
 
-Optional settings can live in `<source>/.bbrs/config.toml` or `<source>/.bbrs/config.json`. CLI flags override file values.
-
-Example `config.json`:
-
-```json
-{
-  "listen": "127.0.0.1",
-  "port": 12525,
-  "destination": "scripts",
-  "host": "home",
-  "patterns": ["*.txt", "*.ns"],
-  "ignore": ["vendor", "tmp,*.map"],
-  "verbose": false
-}
-```
+Optional settings can live in `<source>/.bbrs/config.toml`. CLI flags override file values.
 
 Example `config.toml`:
 
@@ -72,8 +58,8 @@ Example `config.toml`:
 listen = "127.0.0.1"
 port = 12525
 destination = "scripts"
-host = "home"
-patterns = ["*.txt", "*.ns"]
+target = "home"
+include = ["*.txt", "*.ns"]
 ignore = ["vendor", "tmp,*.map"]
 ```
 
@@ -101,7 +87,7 @@ Override with `--log-dir`:
 
 `bbrs` always writes `bbrs_log_<timestamp>.log` inside the chosen directory and creates the directory when needed. The `.bbrs` directory is ignored during sync.
 
-## Patterns
+## Include Patterns
 
 Default included files:
 
@@ -112,15 +98,15 @@ Default included files:
 
 `*.d.ts` is always excluded.
 
-`--pattern` expands the default include set. It does not replace defaults. Repeated and comma-separated patterns both work.
+`--include` expands the default include set. It does not replace defaults. Repeated and comma-separated patterns both work.
 
 ```sh
-./bbrs -s ./src --pattern '*.txt'
-./bbrs -s ./src --pattern '*.js,*.ts,*.ns'
-./bbrs -s ./src --pattern '*.script' --pattern '*.txt'
+./bbrs -s ./src --include '*.txt'
+./bbrs -s ./src --include '*.js,*.ts,*.ns'
+./bbrs -s ./src --include '*.script' --include '*.txt'
 ```
 
-Patterns use Go `path.Match` shell-style glob rules and match slash-normalized relative paths and base filenames.
+Include patterns use Go `path.Match` shell-style glob rules and match slash-normalized relative paths and base filenames.
 
 ## Ignore Patterns
 
@@ -157,9 +143,9 @@ Each sync:
 
 1. Walks `--source`.
 2. Skips ignored paths matching default ignore patterns plus any `--ignore` or `ignore` config values.
-3. Uploads every desired local file to `--host` under `--destination`.
+3. Uploads every desired local file to `--target` under `--destination`.
 4. Fetches remote metadata with `getAllFileMetadata`.
-5. Deletes stale remote files only when they are under `--destination` and match active patterns.
+5. Deletes stale remote files only when they are under `--destination` and match active include patterns.
 
 Individual upload and delete failures are logged and counted in `failed`; other files still sync.
 
