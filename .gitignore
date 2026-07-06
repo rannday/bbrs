@@ -1,9 +1,15 @@
-/bbrs
-*.exe
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go
+bin/
+dist/
 *.test
 *.out
-.bbrs/
-dist/
+coverage.*
+
 tmp/
-coverage.out
-coverage.html
+/bbrs
