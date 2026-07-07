@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +69,24 @@ func TestLoadIgnoresJSONConfig(t *testing.T) {
 	}
 	if file.Port != nil {
 		t.Fatalf("port = %#v", file.Port)
+	}
+}
+
+func TestLoadInvalidConfigReportsPath(t *testing.T) {
+	source := t.TempDir()
+	dir := filepath.Join(source, ".bbrs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("port ="), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(source)
+	if err == nil {
+		t.Fatal("expected invalid config error")
+	}
+	if !strings.Contains(err.Error(), "config.toml") {
+		t.Fatalf("err = %v", err)
 	}
 }

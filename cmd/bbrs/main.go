@@ -162,11 +162,7 @@ func run(args []string, _ *os.File, stdout, stderr io.Writer) error {
 }
 
 func parseConfig(args []string, output io.Writer) (cliConfig, error) {
-	var cfg cliConfig
-	cfg.Listen = "127.0.0.1"
-	cfg.Port = 12525
-	cfg.Destination = "bbrs"
-	cfg.Target = "home"
+	cli := defaultCLIConfig()
 
 	fs := flag.NewFlagSet("bbrs", flag.ContinueOnError)
 	fs.SetOutput(output)
@@ -179,49 +175,51 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	var ignored listFlags
 	fs.BoolVar(&help, "h", false, "show help")
 	fs.BoolVar(&help, "help", false, "show help")
-	fs.BoolVar(&cfg.Verbose, "verbose", false, "enable debug logging")
-	fs.BoolVar(&cfg.Version, "v", false, "print version and exit")
-	fs.BoolVar(&cfg.Version, "version", false, "print version and exit")
-	fs.StringVar(&cfg.Source, "s", "", "local source directory to sync")
-	fs.StringVar(&cfg.Source, "source", "", "local source directory to sync")
-	fs.StringVar(&cfg.Listen, "l", cfg.Listen, "listen address")
-	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "listen address")
-	fs.IntVar(&cfg.Port, "p", cfg.Port, "listen port")
-	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
-	fs.StringVar(&cfg.Destination, "d", cfg.Destination, "destination directory inside Bitburner")
-	fs.StringVar(&cfg.Destination, "destination", cfg.Destination, "destination directory inside Bitburner")
-	fs.StringVar(&cfg.Target, "t", cfg.Target, "target Bitburner host")
-	fs.StringVar(&cfg.Target, "target", cfg.Target, "target Bitburner host")
+	fs.BoolVar(&cli.Verbose, "verbose", false, "enable debug logging")
+	fs.BoolVar(&cli.Version, "v", false, "print version and exit")
+	fs.BoolVar(&cli.Version, "version", false, "print version and exit")
+	fs.StringVar(&cli.Source, "s", "", "local source directory to sync")
+	fs.StringVar(&cli.Source, "source", "", "local source directory to sync")
+	fs.StringVar(&cli.Listen, "l", cli.Listen, "listen address")
+	fs.StringVar(&cli.Listen, "listen", cli.Listen, "listen address")
+	fs.IntVar(&cli.Port, "p", cli.Port, "listen port")
+	fs.IntVar(&cli.Port, "port", cli.Port, "listen port")
+	fs.StringVar(&cli.Destination, "d", cli.Destination, "destination directory inside Bitburner")
+	fs.StringVar(&cli.Destination, "destination", cli.Destination, "destination directory inside Bitburner")
+	fs.StringVar(&cli.Target, "t", cli.Target, "target Bitburner host")
+	fs.StringVar(&cli.Target, "target", cli.Target, "target Bitburner host")
 	fs.Var(&include, "include", "additional filename pattern to include")
 	fs.Var(&ignored, "ignore", "additional filename or directory pattern to ignore during sync")
-	fs.StringVar(&cfg.LogDir, "log-dir", "", "directory for log files")
+	fs.StringVar(&cli.LogDir, "log-dir", "", "directory for log files")
 
 	if err := fs.Parse(args); err != nil {
 		return cliConfig{}, err
 	}
+	explicit := explicitFlags(fs)
 	if help {
 		fs.Usage()
 		return cliConfig{}, flag.ErrHelp
 	}
-	if cfg.Version {
-		return cfg, nil
+	if cli.Version {
+		return cli, nil
 	}
-	cfg.Include = append([]string{}, include...)
-	cfg.Ignore = append([]string{}, ignored...)
-	if cfg.Source == "" {
+	cli.Include = append([]string{}, include...)
+	cli.Ignore = append([]string{}, ignored...)
+	if cli.Source == "" {
 		return cliConfig{}, fmt.Errorf("--source is required")
 	}
-	info, err := os.Stat(cfg.Source)
+	info, err := os.Stat(cli.Source)
 	if err != nil {
-		return cliConfig{}, fmt.Errorf("source %q: %w", cfg.Source, err)
+		return cliConfig{}, fmt.Errorf("source %q: %w", cli.Source, err)
 	}
 	if !info.IsDir() {
-		return cliConfig{}, fmt.Errorf("source %q is not a directory", cfg.Source)
+		return cliConfig{}, fmt.Errorf("source %q is not a directory", cli.Source)
 	}
-	source, err := filepath.Abs(cfg.Source)
+	source, err := filepath.Abs(cli.Source)
 	if err != nil {
-		return cliConfig{}, fmt.Errorf("resolve source %q: %w", cfg.Source, err)
+		return cliConfig{}, fmt.Errorf("resolve source %q: %w", cli.Source, err)
 	}
+	cfg := defaultCLIConfig()
 	cfg.Source = filepath.Clean(source)
 
 	fileCfg, err := config.Load(cfg.Source)
@@ -229,6 +227,7 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 		return cliConfig{}, fmt.Errorf("load config: %w", err)
 	}
 	applyFileConfig(&cfg, fileCfg)
+	applyExplicitCLIConfig(&cfg, cli, explicit)
 
 	normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
 	if err != nil {
@@ -236,6 +235,44 @@ func parseConfig(args []string, output io.Writer) (cliConfig, error) {
 	}
 	cfg.Destination = normalized
 	return cfg, nil
+}
+
+func defaultCLIConfig() cliConfig {
+	return cliConfig{
+		Listen:      "127.0.0.1",
+		Port:        12525,
+		Destination: "bbrs",
+		Target:      "home",
+	}
+}
+
+func explicitFlags(fs *flag.FlagSet) map[string]bool {
+	explicit := make(map[string]bool)
+	fs.Visit(func(flag *flag.Flag) {
+		explicit[canonicalFlagName(flag.Name)] = true
+	})
+	return explicit
+}
+
+func canonicalFlagName(name string) string {
+	switch name {
+	case "s":
+		return "source"
+	case "l":
+		return "listen"
+	case "p":
+		return "port"
+	case "d":
+		return "destination"
+	case "t":
+		return "target"
+	case "v":
+		return "version"
+	case "h":
+		return "help"
+	default:
+		return name
+	}
 }
 
 func applyFileConfig(cfg *cliConfig, file config.File) {
@@ -251,17 +288,44 @@ func applyFileConfig(cfg *cliConfig, file config.File) {
 	if file.Target != "" {
 		cfg.Target = file.Target
 	}
-	if len(file.Include) > 0 && len(cfg.Include) == 0 {
+	if len(file.Include) > 0 {
 		cfg.Include = append([]string{}, file.Include...)
 	}
-	if file.LogDir != "" && cfg.LogDir == "" {
+	if file.LogDir != "" {
 		cfg.LogDir = file.LogDir
 	}
-	if file.Verbose != nil && !cfg.Verbose {
+	if file.Verbose != nil {
 		cfg.Verbose = *file.Verbose
 	}
-	if len(file.Ignore) > 0 && len(cfg.Ignore) == 0 {
+	if len(file.Ignore) > 0 {
 		cfg.Ignore = append([]string{}, file.Ignore...)
+	}
+}
+
+func applyExplicitCLIConfig(cfg *cliConfig, cli cliConfig, explicit map[string]bool) {
+	if explicit["listen"] {
+		cfg.Listen = cli.Listen
+	}
+	if explicit["port"] {
+		cfg.Port = cli.Port
+	}
+	if explicit["destination"] {
+		cfg.Destination = cli.Destination
+	}
+	if explicit["target"] {
+		cfg.Target = cli.Target
+	}
+	if explicit["include"] {
+		cfg.Include = append([]string{}, cli.Include...)
+	}
+	if explicit["ignore"] {
+		cfg.Ignore = append([]string{}, cli.Ignore...)
+	}
+	if explicit["log-dir"] {
+		cfg.LogDir = cli.LogDir
+	}
+	if explicit["verbose"] {
+		cfg.Verbose = cli.Verbose
 	}
 }
 

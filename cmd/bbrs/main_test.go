@@ -223,6 +223,86 @@ verbose = true
 	}
 }
 
+func TestParseConfigExplicitFlagsOverrideFileConfig(t *testing.T) {
+	source := t.TempDir()
+	dir := filepath.Join(source, ".bbrs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := `
+listen = "0.0.0.0"
+port = 13010
+destination = "scripts"
+target = "n00dles"
+include = ["cfg.txt"]
+ignore = ["cfg-ignore"]
+log_dir = "cfg-log"
+verbose = true
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := parseConfig([]string{
+		"-s", source,
+		"--listen", "127.0.0.1",
+		"--port", "12525",
+		"--destination", "bbrs",
+		"--target", "home",
+		"--include", "cli.txt",
+		"--include", "cli.ns",
+		"--ignore", "cli-ignore",
+		"--log-dir", "cli-log",
+		"--verbose=false",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1" {
+		t.Fatalf("listen = %q", cfg.Listen)
+	}
+	if cfg.Port != 12525 {
+		t.Fatalf("port = %d", cfg.Port)
+	}
+	if cfg.Destination != "bbrs" {
+		t.Fatalf("destination = %q", cfg.Destination)
+	}
+	if cfg.Target != "home" {
+		t.Fatalf("target = %q", cfg.Target)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "cli.txt" || cfg.Include[1] != "cli.ns" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+	if len(cfg.Ignore) != 1 || cfg.Ignore[0] != "cli-ignore" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+	if cfg.LogDir != "cli-log" {
+		t.Fatalf("logdir = %q", cfg.LogDir)
+	}
+	if cfg.Verbose {
+		t.Fatal("verbose config value overrode explicit CLI false")
+	}
+}
+
+func TestParseConfigVerboseFlagOverridesFileFalse(t *testing.T) {
+	source := t.TempDir()
+	dir := filepath.Join(source, ".bbrs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("verbose = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := parseConfig([]string{"-s", source, "--verbose"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Verbose {
+		t.Fatal("verbose flag did not override config false")
+	}
+}
+
 func TestParseConfigAcceptsTargetFlags(t *testing.T) {
 	source := t.TempDir()
 	for _, args := range [][]string{
