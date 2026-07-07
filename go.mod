@@ -11,7 +11,7 @@ require (
 )
 
 require (
-	github.com/rannday/go-build-bin v0.1.5 // indirect
+	github.com/rannday/go-build-bin v0.2.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 )
 
