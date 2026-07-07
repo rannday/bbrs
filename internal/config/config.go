@@ -10,7 +10,6 @@ import (
 )
 
 // File holds optional settings loaded from <source>/.bbrs/config.toml.
-// CLI flags override file values when both are set.
 type File struct {
 	Listen      string   `toml:"listen"`
 	Port        *int     `toml:"port"`

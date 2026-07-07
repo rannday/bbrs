@@ -11,46 +11,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rannday/bbrs/internal/bitburner"
-	"github.com/rannday/bbrs/internal/config"
 	"github.com/rannday/bbrs/internal/logging"
 	"github.com/rannday/bbrs/internal/syncer"
 	"github.com/rannday/bbrs/internal/version"
 	"github.com/rannday/bbrs/internal/watch"
 	logx "github.com/rannday/go-log"
 )
-
-type cliConfig struct {
-	Source      string
-	Listen      string
-	Port        int
-	Destination string
-	Target      string
-	Include     []string
-	Ignore      []string
-	Verbose     bool
-	Version     bool
-	LogDir      string
-}
-
-type listFlags []string
-
-func (flags *listFlags) String() string {
-	return strings.Join(*flags, ",")
-}
-
-func (flags *listFlags) Set(value string) error {
-	*flags = append(*flags, value)
-	return nil
-}
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
@@ -159,213 +132,6 @@ func run(args []string, _ *os.File, stdout, stderr io.Writer) error {
 	}
 
 	return nil
-}
-
-func parseConfig(args []string, output io.Writer) (cliConfig, error) {
-	cli := defaultCLIConfig()
-
-	fs := flag.NewFlagSet("bbrs", flag.ContinueOnError)
-	fs.SetOutput(output)
-	fs.Usage = func() {
-		fmt.Fprint(output, helpText())
-	}
-
-	var help bool
-	var include listFlags
-	var ignored listFlags
-	fs.BoolVar(&help, "h", false, "show help")
-	fs.BoolVar(&help, "help", false, "show help")
-	fs.BoolVar(&cli.Verbose, "verbose", false, "enable debug logging")
-	fs.BoolVar(&cli.Version, "v", false, "print version and exit")
-	fs.BoolVar(&cli.Version, "version", false, "print version and exit")
-	fs.StringVar(&cli.Source, "s", "", "local source directory to sync")
-	fs.StringVar(&cli.Source, "source", "", "local source directory to sync")
-	fs.StringVar(&cli.Listen, "l", cli.Listen, "listen address")
-	fs.StringVar(&cli.Listen, "listen", cli.Listen, "listen address")
-	fs.IntVar(&cli.Port, "p", cli.Port, "listen port")
-	fs.IntVar(&cli.Port, "port", cli.Port, "listen port")
-	fs.StringVar(&cli.Destination, "d", cli.Destination, "destination directory inside Bitburner")
-	fs.StringVar(&cli.Destination, "destination", cli.Destination, "destination directory inside Bitburner")
-	fs.StringVar(&cli.Target, "t", cli.Target, "target Bitburner host")
-	fs.StringVar(&cli.Target, "target", cli.Target, "target Bitburner host")
-	fs.Var(&include, "include", "additional filename pattern to include")
-	fs.Var(&ignored, "ignore", "additional filename or directory pattern to ignore during sync")
-	fs.StringVar(&cli.LogDir, "log-dir", "", "directory for log files")
-
-	if err := fs.Parse(args); err != nil {
-		return cliConfig{}, err
-	}
-	explicit := explicitFlags(fs)
-	if help {
-		fs.Usage()
-		return cliConfig{}, flag.ErrHelp
-	}
-	if cli.Version {
-		return cli, nil
-	}
-	cli.Include = append([]string{}, include...)
-	cli.Ignore = append([]string{}, ignored...)
-	if cli.Source == "" {
-		return cliConfig{}, fmt.Errorf("--source is required")
-	}
-	info, err := os.Stat(cli.Source)
-	if err != nil {
-		return cliConfig{}, fmt.Errorf("source %q: %w", cli.Source, err)
-	}
-	if !info.IsDir() {
-		return cliConfig{}, fmt.Errorf("source %q is not a directory", cli.Source)
-	}
-	source, err := filepath.Abs(cli.Source)
-	if err != nil {
-		return cliConfig{}, fmt.Errorf("resolve source %q: %w", cli.Source, err)
-	}
-	cfg := defaultCLIConfig()
-	cfg.Source = filepath.Clean(source)
-
-	fileCfg, err := config.Load(cfg.Source)
-	if err != nil {
-		return cliConfig{}, fmt.Errorf("load config: %w", err)
-	}
-	applyFileConfig(&cfg, fileCfg)
-	applyExplicitCLIConfig(&cfg, cli, explicit)
-
-	normalized, err := syncer.NormalizeRemotePath(cfg.Destination)
-	if err != nil {
-		return cliConfig{}, fmt.Errorf("invalid destination %q: %w", cfg.Destination, err)
-	}
-	cfg.Destination = normalized
-	return cfg, nil
-}
-
-func defaultCLIConfig() cliConfig {
-	return cliConfig{
-		Listen:      "127.0.0.1",
-		Port:        12525,
-		Destination: "bbrs",
-		Target:      "home",
-	}
-}
-
-func explicitFlags(fs *flag.FlagSet) map[string]bool {
-	explicit := make(map[string]bool)
-	fs.Visit(func(flag *flag.Flag) {
-		explicit[canonicalFlagName(flag.Name)] = true
-	})
-	return explicit
-}
-
-func canonicalFlagName(name string) string {
-	switch name {
-	case "s":
-		return "source"
-	case "l":
-		return "listen"
-	case "p":
-		return "port"
-	case "d":
-		return "destination"
-	case "t":
-		return "target"
-	case "v":
-		return "version"
-	case "h":
-		return "help"
-	default:
-		return name
-	}
-}
-
-func applyFileConfig(cfg *cliConfig, file config.File) {
-	if file.Listen != "" {
-		cfg.Listen = file.Listen
-	}
-	if file.Port != nil {
-		cfg.Port = *file.Port
-	}
-	if file.Destination != "" {
-		cfg.Destination = file.Destination
-	}
-	if file.Target != "" {
-		cfg.Target = file.Target
-	}
-	if len(file.Include) > 0 {
-		cfg.Include = append([]string{}, file.Include...)
-	}
-	if file.LogDir != "" {
-		cfg.LogDir = file.LogDir
-	}
-	if file.Verbose != nil {
-		cfg.Verbose = *file.Verbose
-	}
-	if len(file.Ignore) > 0 {
-		cfg.Ignore = append([]string{}, file.Ignore...)
-	}
-}
-
-func applyExplicitCLIConfig(cfg *cliConfig, cli cliConfig, explicit map[string]bool) {
-	if explicit["listen"] {
-		cfg.Listen = cli.Listen
-	}
-	if explicit["port"] {
-		cfg.Port = cli.Port
-	}
-	if explicit["destination"] {
-		cfg.Destination = cli.Destination
-	}
-	if explicit["target"] {
-		cfg.Target = cli.Target
-	}
-	if explicit["include"] {
-		cfg.Include = append([]string{}, cli.Include...)
-	}
-	if explicit["ignore"] {
-		cfg.Ignore = append([]string{}, cli.Ignore...)
-	}
-	if explicit["log-dir"] {
-		cfg.LogDir = cli.LogDir
-	}
-	if explicit["verbose"] {
-		cfg.Verbose = cli.Verbose
-	}
-}
-
-func helpText() string {
-	return `Usage:
-  bbrs -s ./source-dir [options]
-
-Options:
-  -s, --source               Local source directory to sync. Required
-  -d, --destination          Destination directory inside Bitburner. Default: /bbrs/
-  -l, --listen               Listen address. Default: 127.0.0.1
-  -p, --port                 Listen port. Default: 12525
-  -t, --target               Target Bitburner host. Default: home
-      --include              Additional filename patterns to include.
-      --ignore               Additional filename or directory patterns to ignore.
-      --log-dir              Directory for log files.
-      --verbose              Enable debug logging.
-  -v, --version              Print version and exit.
-  -h, --help                 Show help.
-
-Config file:
-  Optional settings in <source>/.bbrs/config.toml.
-  CLI flags override config file values.
-
-Persistent cache:
-  Upload cache stored in <source>/.bbrs/cache.json across restarts.
-
-Include examples:
-  --include '*.txt'
-  --include '*.js,*.ts,*.ns'
-  --include '*.script' --include '*.txt'
-
-Ignore examples:
-  --ignore dist
-  --ignore dist,tmp,*.map
-  --ignore vendor --ignore '*.map'
-
-Logging:
-  Default: /var/log/bbrs/ on *nix when present, otherwise <source>/.bbrs/
-`
 }
 
 type syncJob struct {

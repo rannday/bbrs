@@ -7,6 +7,7 @@ require github.com/coder/websocket v1.8.15
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rannday/go-conf v0.3.0
+	github.com/rannday/go-env v0.2.0
 	github.com/rannday/go-log v0.2.0
 )
 

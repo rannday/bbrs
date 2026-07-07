@@ -18,6 +18,47 @@ import (
 	logx "github.com/rannday/go-log"
 )
 
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "bbrs-test-config-")
+	if err != nil {
+		panic(err)
+	}
+	defaultConfigPaths = configPaths{
+		SystemEnvPath: filepath.Join(root, "missing-system.env"),
+		UserEnvPath:   filepath.Join(root, "missing-user.env"),
+	}
+	restoreEnv := unsetBBRSEnv()
+
+	code := m.Run()
+
+	restoreEnv()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
+func unsetBBRSEnv() func() {
+	type previous struct {
+		key   string
+		value string
+		ok    bool
+	}
+	values := make([]previous, 0, len(bbrsEnvKeys))
+	for _, key := range bbrsEnvKeys {
+		value, ok := os.LookupEnv(key)
+		values = append(values, previous{key: key, value: value, ok: ok})
+		_ = os.Unsetenv(key)
+	}
+	return func() {
+		for _, prev := range values {
+			if prev.ok {
+				_ = os.Setenv(prev.key, prev.value)
+				continue
+			}
+			_ = os.Unsetenv(prev.key)
+		}
+	}
+}
+
 type fakeRemoteClient struct {
 	mu           sync.Mutex
 	connected    bool
@@ -114,6 +155,36 @@ func testOptions(t *testing.T) syncer.Options {
 		Patterns: patterns,
 		Ignored:  ignored,
 		State:    syncer.NewState(),
+	}
+}
+
+func testConfigPaths(t *testing.T) configPaths {
+	t.Helper()
+	root := t.TempDir()
+	return configPaths{
+		SystemEnvPath: filepath.Join(root, "system.env"),
+		UserEnvPath:   filepath.Join(root, "user.env"),
+	}
+}
+
+func writeEnvFile(t *testing.T, path, payload string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(payload), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeSourceConfig(t *testing.T, source, payload string) {
+	t.Helper()
+	dir := filepath.Join(source, ".bbrs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(payload), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -220,6 +291,234 @@ verbose = true
 	}
 	if len(cfg.Ignore) != 2 || cfg.Ignore[0] != "dist" || cfg.Ignore[1] != "tmp,*.map" {
 		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+}
+
+func TestParseConfigSystemEnvOverridesDefaults(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, `
+BBRS_LISTEN=0.0.0.0
+BBRS_PORT=13001
+BBRS_DESTINATION=scripts
+BBRS_TARGET=n00dles
+BBRS_INCLUDE=*.txt,*.ns
+BBRS_IGNORE=vendor,tmp
+BBRS_LOG_DIR=system-log
+BBRS_VERBOSE=true
+`)
+
+	cfg, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "0.0.0.0" || cfg.Port != 13001 || cfg.Destination != "scripts" || cfg.Target != "n00dles" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if cfg.LogDir != "system-log" || !cfg.Verbose {
+		t.Fatalf("log/verbose = %q/%v", cfg.LogDir, cfg.Verbose)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "*.txt" || cfg.Include[1] != "*.ns" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+	if len(cfg.Ignore) != 2 || cfg.Ignore[0] != "vendor" || cfg.Ignore[1] != "tmp" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+}
+
+func TestParseConfigUserEnvOverridesSystemEnv(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT=13001\nBBRS_TARGET=system\nBBRS_INCLUDE=system\n")
+	writeEnvFile(t, paths.UserEnvPath, "BBRS_PORT=13002\nBBRS_TARGET=user\nBBRS_INCLUDE=user-a,user-b\n")
+
+	cfg, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 13002 || cfg.Target != "user" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "user-a" || cfg.Include[1] != "user-b" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+}
+
+func TestParseConfigProjectConfigOverridesEnvFiles(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT=13001\nBBRS_TARGET=system\n")
+	writeEnvFile(t, paths.UserEnvPath, "BBRS_PORT=13002\nBBRS_TARGET=user\n")
+	writeSourceConfig(t, source, `
+port = 13003
+target = "project"
+include = ["project"]
+ignore = ["project-ignore"]
+`)
+
+	cfg, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 13003 || cfg.Target != "project" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if len(cfg.Include) != 1 || cfg.Include[0] != "project" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+	if len(cfg.Ignore) != 1 || cfg.Ignore[0] != "project-ignore" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+}
+
+func TestParseConfigProcessEnvOverridesProjectConfig(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT=13001\n")
+	writeSourceConfig(t, source, `
+port = 13003
+target = "project"
+include = ["project"]
+`)
+	t.Setenv("BBRS_PORT", "13004")
+	t.Setenv("BBRS_TARGET", "process")
+	t.Setenv("BBRS_INCLUDE", "process-a, process-b")
+
+	cfg, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 13004 || cfg.Target != "process" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "process-a" || cfg.Include[1] != "process-b" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+}
+
+func TestParseConfigCLIOverridesEverything(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT=13001\nBBRS_TARGET=system\n")
+	writeEnvFile(t, paths.UserEnvPath, "BBRS_PORT=13002\nBBRS_TARGET=user\n")
+	writeSourceConfig(t, source, "port = 13003\ntarget = \"project\"\nverbose = true\n")
+	t.Setenv("BBRS_PORT", "13004")
+	t.Setenv("BBRS_TARGET", "process")
+	t.Setenv("BBRS_VERBOSE", "true")
+
+	cfg, err := parseConfigWithPaths([]string{
+		"-s", source,
+		"--port", "13005",
+		"--target", "cli",
+		"--verbose=false",
+	}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 13005 || cfg.Target != "cli" || cfg.Verbose {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestParseConfigProcessEnvSourceLoadsProjectConfigFromThatSource(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeSourceConfig(t, source, "port = 13007\n")
+	t.Setenv("BBRS_SOURCE", source)
+
+	cfg, err := parseConfigWithPaths(nil, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Source != filepath.Clean(source) || cfg.Port != 13007 {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestParseConfigCLIListFlagsReplaceEarlierListLayers(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_INCLUDE=system\nBBRS_IGNORE=system-ignore\n")
+	writeSourceConfig(t, source, `
+include = ["project"]
+ignore = ["project-ignore"]
+`)
+	t.Setenv("BBRS_INCLUDE", "process")
+	t.Setenv("BBRS_IGNORE", "process-ignore")
+
+	cfg, err := parseConfigWithPaths([]string{
+		"-s", source,
+		"--include", "cli-a,cli-b",
+		"--include", "cli-c",
+		"--ignore", "cli-ignore",
+	}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Include) != 2 || cfg.Include[0] != "cli-a,cli-b" || cfg.Include[1] != "cli-c" {
+		t.Fatalf("include = %#v", cfg.Include)
+	}
+	if len(cfg.Ignore) != 1 || cfg.Ignore[0] != "cli-ignore" {
+		t.Fatalf("ignore = %#v", cfg.Ignore)
+	}
+
+	patterns, err := syncer.NewPatterns(cfg.Include)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := patterns.IncludePatterns()
+	if len(got) != 5 || got[0] != "*.js" || got[1] != "*.ts" || got[2] != "cli-a" || got[3] != "cli-b" || got[4] != "cli-c" {
+		t.Fatalf("expanded include = %#v", got)
+	}
+}
+
+func TestParseConfigMissingEnvFilesIgnored(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+
+	cfg, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 12525 {
+		t.Fatalf("port = %d", cfg.Port)
+	}
+}
+
+func TestParseConfigMalformedEnvFileFailsClearly(t *testing.T) {
+	source := t.TempDir()
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT\n")
+
+	_, err := parseConfigWithPaths([]string{"-s", source}, &bytes.Buffer{}, paths)
+	if err == nil {
+		t.Fatal("expected malformed env file error")
+	}
+	text := err.Error()
+	if !strings.Contains(text, "load env file") || !strings.Contains(text, paths.SystemEnvPath) || !strings.Contains(text, "dotenv") || !strings.Contains(text, ":1:") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseConfigVersionAndHelpSkipEnvFileLoading(t *testing.T) {
+	paths := testConfigPaths(t)
+	writeEnvFile(t, paths.SystemEnvPath, "BBRS_PORT\n")
+
+	cfg, err := parseConfigWithPaths([]string{"--version"}, &bytes.Buffer{}, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Version {
+		t.Fatal("version not set")
+	}
+
+	var output bytes.Buffer
+	_, err = parseConfigWithPaths([]string{"--help"}, &output, paths)
+	if err != flag.ErrHelp {
+		t.Fatalf("err = %v, want flag.ErrHelp", err)
+	}
+	if !strings.Contains(output.String(), "Configuration precedence:") {
+		t.Fatalf("help missing precedence:\n%s", output.String())
 	}
 }
 

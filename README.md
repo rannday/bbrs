@@ -48,9 +48,47 @@ On sync, `bbrs` logs `uploaded`, `skipped`, `deleted`, `ignored`, and `failed` c
 
 `--listen` defaults to `127.0.0.1`. If you set another listen address, `bbrs` uses it.
 
+## Configuration
+
+Configuration loads in this order, lowest to highest precedence:
+
+```text
+coded defaults < /etc/bbrs/env < ~/conf/bbrs/env < <source>/.bbrs/config.toml < process env vars < CLI args
+```
+
+Missing env files are ignored. Malformed env files fail with the file path and line number. `~` in `~/conf/bbrs/env` is expanded with the current user's home directory.
+
+Supported environment variables:
+
+```text
+BBRS_SOURCE
+BBRS_LISTEN
+BBRS_PORT
+BBRS_DESTINATION
+BBRS_TARGET
+BBRS_INCLUDE
+BBRS_IGNORE
+BBRS_LOG_DIR
+BBRS_VERBOSE
+```
+
+`BBRS_INCLUDE` and `BBRS_IGNORE` are comma-separated lists.
+
+Example `/etc/bbrs/env` or `~/conf/bbrs/env`:
+
+```env
+BBRS_LISTEN=127.0.0.1
+BBRS_PORT=12525
+BBRS_DESTINATION=scripts
+BBRS_TARGET=home
+BBRS_INCLUDE=*.txt,*.ns
+BBRS_IGNORE=vendor,tmp,*.map
+BBRS_VERBOSE=false
+```
+
 ## Config File
 
-Optional settings can live in `<source>/.bbrs/config.toml`. CLI flags override file values.
+Optional settings can live in `<source>/.bbrs/config.toml`.
 
 Example `config.toml`:
 
